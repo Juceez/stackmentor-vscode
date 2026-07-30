@@ -1,0 +1,111 @@
+{
+  "name": "stackmentor",
+  "displayName": "StackMentor",
+  "description": "Help students learn programming in practice with the StackMentor AI",
+  "publisher": "stackmentor",
+  "version": "0.0.1",
+  "license": "MIT",
+  "icon": "resources/SM-png-small.png",
+  "homepage": "https://stackmentor.dev",
+  "keywords": [
+    "education",
+    "programming",
+    "coding",
+    "learning",
+    "mentor"
+  ],
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "Education",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:stackmentor.sidebar",
+    "onCommand:stackmentor.open",
+    "onCommand:stackmentor.refresh",
+    "onCommand:stackmentor.newChat",
+    "onCommand:stackmentor.signOut"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "stackmentor",
+          "title": "StackMentor",
+          "icon": "resources/stackmentor.svg"
+        }
+      ]
+    },
+    "views": {
+      "stackmentor": [
+        {
+          "type": "webview",
+          "id": "stackmentor.sidebar",
+          "name": "StackMentor"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "stackmentor.open",
+        "title": "StackMentor: Open"
+      },
+      {
+        "command": "stackmentor.refresh",
+        "title": "StackMentor: Refresh"
+      },
+      {
+        "command": "stackmentor.newChat",
+        "title": "StackMentor: New Chat"
+      },
+      {
+        "command": "stackmentor.signOut",
+        "title": "StackMentor: Sign Out"
+      }
+    ],
+    "configuration": {
+      "title": "StackMentor",
+      "properties": {
+        "stackmentor.apiBaseUrl": {
+          "type": "string",
+          "scope": "machine",
+          "default": "https://api.stackmentor.dev",
+          "description": "Base URL for the StackMentor-operated backend API. HTTPS is required."
+        },
+        "stackmentor.frontendBaseUrl": {
+          "type": "string",
+          "scope": "machine",
+          "default": "https://stackmentor.dev",
+          "description": "Base URL for StackMentor web pages used for sign-up and password reset. HTTPS is required."
+        }
+      }
+    },
+    "menus": {}
+  },
+  "scripts": {
+    "vscode:prepublish": "tsc -p ./tsconfig.json",
+    "compile": "tsc -p ./tsconfig.json",
+    "watch": "tsc -watch -p ./tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc -p ./tsconfig.json && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
