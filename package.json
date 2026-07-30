@@ -7,6 +7,10 @@
   "license": "MIT",
   "icon": "resources/SM-png-small.png",
   "homepage": "https://stackmentor.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Juceez/stackmentor.git"
+  },
   "keywords": [
     "education",
     "programming",
@@ -92,6 +96,7 @@
     "typecheck": "tsc --noEmit",
     "pretest": "tsc -p ./tsconfig.json && npm run lint",
     "lint": "eslint src",
+    "package": "vsce package --no-dependencies",
     "test": "vscode-test"
   },
   "devDependencies": {
@@ -100,6 +105,7 @@
     "@types/vscode": "^1.125.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.6.0",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1"

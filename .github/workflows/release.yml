@@ -1,0 +1,55 @@
+name: Release extension
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Release Please updates package.json, package-lock.json, and CHANGELOG.md
+      # in a pull request, then creates the GitHub Release after that PR merges.
+      - name: Create or update release
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Set up Node.js
+        if: steps.release.outputs.release_created == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.release.outputs.release_created == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.release.outputs.release_created == 'true'
+        run: npm run typecheck
+
+      - name: Run ESLint
+        if: steps.release.outputs.release_created == 'true'
+        run: npm run lint
+
+      - name: Package VSIX
+        if: steps.release.outputs.release_created == 'true'
+        run: npm run package -- --out "stackmentor-${{ steps.release.outputs.tag_name }}.vsix"
+
+      - name: Attach VSIX to GitHub Release
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.release.outputs.tag_name }}" "stackmentor-${{ steps.release.outputs.tag_name }}.vsix" --clobber
