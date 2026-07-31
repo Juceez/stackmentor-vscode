@@ -128,7 +128,7 @@ type WebviewIncomingMessage =
   | { type: "setConversationVisibility"; isVisible: boolean }
   | { type: "login"; email: string; password: string }
   | { type: "openSignUp" }
-  | { type: "forgotPassword" }
+  | { type: "forgotPassword"; email?: string }
   | { type: "signOut" }
   | { type: "refresh" }
   | { type: "retryConnection" }
@@ -1082,7 +1082,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         await this.openSignUp();
         return;
       case "forgotPassword":
-        await this.openForgotPassword();
+        await this.openForgotPassword(message.email);
         return;
       case "signOut":
         await this.signOut();
@@ -1157,9 +1157,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     await this.openAuthPage({ mode: "signup" });
   }
 
-  private async openForgotPassword(): Promise<void> {
+  private async openForgotPassword(email?: string): Promise<void> {
     await this.openAuthPage({
       mode: "login",
+      email,
       forgotPassword: true,
     });
   }
@@ -3224,11 +3225,16 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
   private async openAuthPage(options: {
     mode: "login" | "signup";
+    email?: string;
     forgotPassword?: boolean;
   }): Promise<void> {
     const authUrl = new URL("/auth", this.getFrontendBaseUrl());
 
     authUrl.searchParams.set("mode", options.mode);
+
+    if (options.email?.trim()) {
+      authUrl.searchParams.set("email", options.email.trim());
+    }
 
     if (options.forgotPassword) {
       authUrl.searchParams.set("forgotPassword", "1");
@@ -7396,6 +7402,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             setDraftFromInputs();
             vscode.postMessage({
               type: "forgotPassword",
+              email: draft.email,
             });
           });
         }

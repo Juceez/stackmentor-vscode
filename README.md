@@ -34,7 +34,7 @@ The extension is not a standalone offline or personal-use tool. You need an acco
 
 ## Setup for students
 
-1. Install the extension from the release or `.vsix` file provided by the StackMentor operator.
+1. Install the extension from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=StackMentor.stackmentor).
 2. Open the StackMentor activity bar item.
 3. Sign in with the account provided by your school or deployment operator.
 4. Select a school and course, then start a chat.

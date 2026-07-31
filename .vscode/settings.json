@@ -6,6 +6,10 @@
 	"search.exclude": {
 		"out": true // set this to false to include "out" folder in search results
 	},
+	// The extension development workspace talks to the local frontend/backend.
+	// Installed releases keep the public defaults declared in package.json.
+	"stackmentor.apiBaseUrl": "http://127.0.0.1:8000",
+	"stackmentor.frontendBaseUrl": "http://127.0.0.1:3000",
 	// Turn off tsc task auto detection since we have the necessary tasks as npm scripts
 	"js/ts.tsc.autoDetect": "off"
 }
