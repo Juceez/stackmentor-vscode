@@ -2,7 +2,7 @@
   "name": "stackmentor",
   "displayName": "StackMentor",
   "description": "Help students learn programming in practice with the StackMentor AI",
-  "publisher": "stackmentor",
+  "publisher": "StackMentor",
   "version": "0.0.1",
   "license": "MIT",
   "icon": "resources/SM-png-small.png",
