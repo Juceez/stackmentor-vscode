@@ -75,7 +75,10 @@ The backend stores account and chat data and may process mentor context using it
 
 ## Support and security
 
-For general support, see [SUPPORT.md](SUPPORT.md). Please do not include student code, chat history, credentials, or other confidential data in public issues.
+Public GitHub Issues and pull requests are disabled. For general support, see
+[SUPPORT.md](SUPPORT.md). Please do not include student code, chat history,
+credentials, or other confidential data in repository content or support
+requests.
 
 Report security vulnerabilities privately according to the repository's [security policy](SECURITY.md).
 

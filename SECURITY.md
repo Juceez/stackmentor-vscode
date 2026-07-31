@@ -2,12 +2,13 @@
 
 ## Reporting a vulnerability
 
-Please do not report security vulnerabilities in a public GitHub issue.
+Public GitHub Issues and pull requests are disabled. Never disclose a security
+vulnerability in a public repository comment or discussion.
 
 Use GitHub's private vulnerability reporting feature from the repository's
 **Security** tab when it is available. If private reporting is not enabled,
-email [support@stackmentor.dev](mailto:support@stackmentor.dev) before sharing
-details publicly.
+email [support@stackmentor.dev](mailto:support@stackmentor.dev) instead. Do not
+share security details publicly.
 
 When reporting a vulnerability, include:
 
@@ -19,7 +20,7 @@ When reporting a vulnerability, include:
 Please remove passwords, access tokens, student code, chat history, course
 materials, school information, and other personal or confidential data from
 the report. If such data is necessary to demonstrate the issue, explain that
-privately rather than posting it publicly.
+privately rather than posting it in the repository.
 
 ## Scope
 
