@@ -320,6 +320,42 @@ suite("StackMentor API helpers", () => {
     }
   });
 
+  test("StackMentorApiClient sends authenticated logout to the backend", async () => {
+    const session: AuthSession = {
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      userId: "user-1",
+      email: "student@example.com",
+    };
+    const originalFetch = globalThis.fetch;
+    let authorizationHeader: string | null = null;
+    globalThis.fetch = (async (_input: string | URL, init?: RequestInit) => {
+      authorizationHeader =
+        init?.headers instanceof Headers
+          ? init.headers.get("Authorization")
+          : null;
+      return new Response(JSON.stringify({ message: "Logged out successfully." }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => session,
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+
+      await client.logout();
+
+      assert.strictEqual(authorizationHeader, "Bearer access-token");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("StackMentorApiClient refreshes before opening a mentor stream after a 401", async () => {
     let session: AuthSession | null = {
       accessToken: "expired-token",

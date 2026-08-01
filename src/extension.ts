@@ -30,6 +30,35 @@ import {
 } from "./api";
 
 const SESSION_SECRET_KEY = "stackmentor.session";
+const STORED_SESSION_VERSION = 1;
+
+export function parseStoredSession(
+  stored: string,
+  currentApiBaseUrl: string,
+): AuthSession | null {
+  try {
+    const parsed = JSON.parse(stored) as {
+      version?: unknown;
+      apiBaseUrl?: unknown;
+      session?: Partial<AuthSession>;
+    };
+    const session = parsed.session;
+    if (
+      parsed.version !== STORED_SESSION_VERSION ||
+      parsed.apiBaseUrl !== currentApiBaseUrl ||
+      !session ||
+      typeof session.accessToken !== "string" ||
+      typeof session.refreshToken !== "string" ||
+      typeof session.userId !== "string" ||
+      typeof session.email !== "string"
+    ) {
+      return null;
+    }
+    return session as AuthSession;
+  } catch {
+    return null;
+  }
+}
 // Refresh the stored auth session periodically so an active user doesn't
 // get kicked out just because they left VS Code open for a while.
 const SESSION_KEEPALIVE_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -128,7 +157,7 @@ type WebviewIncomingMessage =
   | { type: "setConversationVisibility"; isVisible: boolean }
   | { type: "login"; email: string; password: string }
   | { type: "openSignUp" }
-  | { type: "forgotPassword"; email?: string }
+  | { type: "forgotPassword" }
   | { type: "signOut" }
   | { type: "refresh" }
   | { type: "retryConnection" }
@@ -937,6 +966,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   private openChatRequestToken = 0;
   private sessionKeepaliveTimer: ReturnType<typeof setTimeout> | null = null;
   private studentUsageRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private sessionApiBaseUrl: string | null = null;
+  private sessionWritesBlocked = false;
 
   private htmlCache: string | null = null;
   private stateVersion = 0;
@@ -948,19 +979,39 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     this.state = this.createEmptyState();
     this.api = new StackMentorApiClient({
       getBaseUrl: () => this.getApiBaseUrl(),
-      getSession: async () => this.session,
+      getSession: async () => {
+        if (this.session && this.sessionApiBaseUrl !== this.getApiBaseUrl()) {
+          this.sessionWritesBlocked = true;
+          await this.clearStoredSession();
+          this.session = null;
+          this.sessionApiBaseUrl = null;
+          return null;
+        }
+        return this.session;
+      },
       saveSession: async (session) => {
+        if (this.sessionWritesBlocked) {
+          return;
+        }
         this.session = session;
         await this.writeSession(session);
         this.scheduleSessionKeepaliveRefresh();
       },
       clearSession: async () => {
         this.session = null;
+        this.sessionApiBaseUrl = null;
         this.clearSessionKeepaliveRefresh();
         this.clearStudentUsageRefresh();
         await this.clearStoredSession();
       },
     });
+    this.context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("stackmentor.apiBaseUrl")) {
+          void this.handleApiBaseUrlChange();
+        }
+      }),
+    );
   }
 
   /** @internal */
@@ -1039,6 +1090,33 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async signOut(): Promise<void> {
+    if (this.session) {
+      this.sessionWritesBlocked = true;
+      try {
+        await this.api.logout();
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          await this.clearLocalSession();
+          this.updateState({
+            errorMessage: this.toErrorMessage(error),
+            canRetryConnection: false,
+          });
+          return;
+        }
+        this.sessionWritesBlocked = false;
+        this.updateState({
+          errorMessage: this.toErrorMessage(error),
+          canRetryConnection: this.isConnectionError(error),
+        });
+        return;
+      }
+    }
+
+    await this.clearLocalSession();
+  }
+
+  private async clearLocalSession(): Promise<void> {
+    this.sessionWritesBlocked = true;
     this.bumpWorkspaceStateEpoch();
     this.stopPendingMentorTracking();
     this.clearSessionKeepaliveRefresh();
@@ -1052,6 +1130,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     this.backgroundTrackedJobIds.clear();
     await this.clearStoredSession();
     this.session = null;
+    this.sessionApiBaseUrl = null;
     await this.context.workspaceState.update(SELECTED_SCHOOL_KEY, undefined);
     await this.context.workspaceState.update(SELECTED_COURSE_KEY, undefined);
     await this.context.workspaceState.update(
@@ -1082,7 +1161,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         await this.openSignUp();
         return;
       case "forgotPassword":
-        await this.openForgotPassword(message.email);
+        await this.openForgotPassword();
         return;
       case "signOut":
         await this.signOut();
@@ -1139,6 +1218,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
     try {
       const session = await this.api.login(normalizedEmail, password);
+      this.sessionWritesBlocked = false;
       this.session = session;
       await this.writeSession(session);
       this.scheduleSessionKeepaliveRefresh();
@@ -1157,11 +1237,9 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     await this.openAuthPage({ mode: "signup" });
   }
 
-  private async openForgotPassword(email?: string): Promise<void> {
+  private async openForgotPassword(): Promise<void> {
     await this.openAuthPage({
       mode: "login",
-      email,
-      forgotPassword: true,
     });
   }
 
@@ -1537,7 +1615,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       const message = this.toErrorMessage(error);
 
       if (error instanceof ApiError && error.status === 401) {
-        await this.signOut();
+        await this.clearLocalSession();
         this.updateState({
           errorMessage: message,
           canRetryConnection: false,
@@ -2423,7 +2501,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       this.clearPendingReply(optimisticConversationId);
 
       if (error instanceof ApiError && error.status === 401) {
-        await this.signOut();
+        await this.clearLocalSession();
         return;
       }
 
@@ -2514,7 +2592,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     this.clearPendingReply(input.optimisticConversationId);
 
     if (input.error instanceof ApiError && input.error.status === 401) {
-      await this.signOut();
+      await this.clearLocalSession();
       return;
     }
 
@@ -3225,28 +3303,24 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
   private async openAuthPage(options: {
     mode: "login" | "signup";
-    email?: string;
-    forgotPassword?: boolean;
   }): Promise<void> {
     const authUrl = new URL("/auth", this.getFrontendBaseUrl());
 
     authUrl.searchParams.set("mode", options.mode);
 
-    if (options.email?.trim()) {
-      authUrl.searchParams.set("email", options.email.trim());
-    }
-
-    if (options.forgotPassword) {
-      authUrl.searchParams.set("forgotPassword", "1");
-    }
-
     await vscode.env.openExternal(vscode.Uri.parse(authUrl.toString()));
   }
 
   private async writeSession(session: AuthSession): Promise<void> {
+    const apiBaseUrl = this.getApiBaseUrl();
+    this.sessionApiBaseUrl = apiBaseUrl;
     await this.context.secrets.store(
       SESSION_SECRET_KEY,
-      JSON.stringify(session),
+      JSON.stringify({
+        version: STORED_SESSION_VERSION,
+        apiBaseUrl,
+        session,
+      }),
     );
   }
 
@@ -3257,7 +3331,13 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      return JSON.parse(stored) as AuthSession;
+      const session = parseStoredSession(stored, this.getApiBaseUrl());
+      if (!session) {
+        await this.clearStoredSession();
+        return null;
+      }
+      this.sessionApiBaseUrl = this.getApiBaseUrl();
+      return session;
     } catch {
       await this.clearStoredSession();
       return null;
@@ -3266,6 +3346,17 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
   private async clearStoredSession(): Promise<void> {
     await this.context.secrets.delete(SESSION_SECRET_KEY);
+  }
+
+  private async handleApiBaseUrlChange(): Promise<void> {
+    if (!this.session || this.sessionApiBaseUrl === this.getApiBaseUrl()) {
+      return;
+    }
+    await this.clearLocalSession();
+    this.updateState({
+      errorMessage: "The StackMentor server changed. Log in to the new server.",
+      canRetryConnection: false,
+    });
   }
 
   private scheduleSessionKeepaliveRefresh(): void {
@@ -3296,6 +3387,9 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       const refreshed = await this.api.refreshSession(
         this.session.refreshToken,
       );
+      if (this.sessionWritesBlocked) {
+        return;
+      }
       this.session = refreshed;
       await this.writeSession(refreshed);
       this.scheduleSessionKeepaliveRefresh();
@@ -3303,7 +3397,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       // Keep the current session in place unless the backend says it is
       // truly invalid. A temporary network problem should not log the user out.
       if (error instanceof ApiError && error.status === 401) {
-        await this.signOut();
+        await this.clearLocalSession();
         this.updateState({
           errorMessage: this.toErrorMessage(error),
           canRetryConnection: false,
@@ -7400,10 +7494,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         if (forgotPasswordLink) {
           forgotPasswordLink.addEventListener("click", () => {
             setDraftFromInputs();
-            vscode.postMessage({
-              type: "forgotPassword",
-              email: draft.email,
-            });
+            vscode.postMessage({ type: "forgotPassword" });
           });
         }
 

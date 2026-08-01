@@ -26,9 +26,29 @@ import {
   hasReachedStudentMessageLimit,
   getStreamingRevealDelayMs,
   splitStreamingRevealUnits,
+  parseStoredSession,
 } from "../extension";
 
 suite("StackMentor extension helpers", () => {
+  test("stored sessions are accepted only for the API origin that issued them", () => {
+    const stored = JSON.stringify({
+      version: 1,
+      apiBaseUrl: "https://api.stackmentor.dev",
+      session: {
+        accessToken: "access",
+        refreshToken: "refresh",
+        userId: "user-1",
+        email: "student@example.com",
+      },
+    });
+
+    assert.ok(parseStoredSession(stored, "https://api.stackmentor.dev"));
+    assert.strictEqual(
+      parseStoredSession(stored, "https://attacker.example"),
+      null,
+    );
+  });
+
   test("splits streaming output into words without revealing an incomplete trailing word", () => {
     assert.deepStrictEqual(splitStreamingRevealUnits("Hello wor"), {
       units: ["Hello"],

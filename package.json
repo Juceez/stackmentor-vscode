@@ -3,7 +3,7 @@
   "displayName": "StackMentor",
   "description": "Help students learn programming in practice with the StackMentor AI",
   "publisher": "StackMentor",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "license": "MIT",
   "icon": "resources/SM-png-small.png",
   "homepage": "https://stackmentor.dev",
@@ -75,13 +75,13 @@
       "properties": {
         "stackmentor.apiBaseUrl": {
           "type": "string",
-          "scope": "machine-overridable",
+          "scope": "machine",
           "default": "https://api.stackmentor.dev",
           "description": "Base URL for the StackMentor-operated backend API. HTTPS is required for non-local URLs."
         },
         "stackmentor.frontendBaseUrl": {
           "type": "string",
-          "scope": "machine-overridable",
+          "scope": "machine",
           "default": "https://stackmentor.dev",
           "description": "Base URL for StackMentor web pages used for sign-up and password reset. HTTPS is required for non-local URLs."
         }

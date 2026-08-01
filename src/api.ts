@@ -536,6 +536,12 @@ export class StackMentorApiClient {
     }
   }
 
+  async logout(): Promise<void> {
+    await this.request<{ message: string }>("/auth/logout", {
+      method: "POST",
+    });
+  }
+
   private async refreshAfterUnauthorized(
     session: AuthSession,
   ): Promise<AuthSession> {
