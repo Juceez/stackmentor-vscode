@@ -6884,11 +6884,19 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         try {
+          const [yearText, monthText, dayText] = String(value)
+            .slice(0, 10)
+            .split("-");
+          const calendarDate = new Date(
+            Number(yearText),
+            Number(monthText) - 1,
+            Number(dayText),
+          );
           return new Intl.DateTimeFormat(undefined, {
             year: "numeric",
             month: "short",
             day: "numeric",
-          }).format(new Date(value));
+          }).format(calendarDate);
         } catch {
           return value;
         }
