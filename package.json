@@ -3,7 +3,7 @@
   "displayName": "StackMentor",
   "description": "Help students learn programming in practice with the StackMentor AI",
   "publisher": "StackMentor",
-  "version": "0.0.6",
+  "version": "0.0.2",
   "license": "MIT",
   "icon": "resources/SM-png-small.png",
   "homepage": "https://stackmentor.dev",
