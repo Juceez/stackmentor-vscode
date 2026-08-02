@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { randomUUID } from "crypto";
 
 import {
   ApiError,
@@ -72,7 +73,6 @@ const CURRENT_CONVERSATION_KEY = "stackmentor.currentConversationId";
 const VIEW_TYPE = "stackmentor.sidebar";
 const VIEW_CONTAINER_ID = "stackmentor";
 const MAX_CACHED_CONVERSATIONS = 50;
-const MICROUSD_PER_CENT = 10000;
 const LEAKED_CODE_PLACEHOLDER_PATTERN = /@@CODE_?\d+@@/g;
 const PROTECTED_CONTEXT_FILE_PATTERN =
   /(^|\/)(?:\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|[^/]+\.(?:pem|key|p12|pfx|jks))$/i;
@@ -111,6 +111,7 @@ type PendingMentorReply = {
   content: string;
   failureCode?: string | null;
   errorMessage?: string | null;
+  clientRequestId?: string;
 };
 
 type LocalCancelledPartialContext = {
@@ -180,14 +181,13 @@ export function shouldFallbackToLegacySendTransport(error: unknown): boolean {
 }
 
 export function isRetryableMentorSendError(error: unknown): boolean {
-  if (!(error instanceof ApiError)) {
-    return false;
-  }
-
   // These responses are temporary: keep the student's draft in the chat so
   // they can resend it once the service has recovered. Do not offer retry for
   // access and validation errors, which require a different user action.
-  return error.status === 408 || error.status === 429 || error.status >= 500;
+  if (error instanceof ApiError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  return error instanceof Error;
 }
 
 export function splitStreamingRevealUnits(
@@ -941,6 +941,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   private pollToken = 0;
   private sendRequestToken = 0;
   private cancelledSendRequestTokens = new Set<number>();
+  private cancellationInFlight = false;
   private activeJobAbortController: AbortController | null = null;
   private readonly api: StackMentorApiClient;
   private conversationHistoryCache = new Map<string, ConversationHistory>();
@@ -1896,7 +1897,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     await this.persistSelection();
   }
 
-  private async sendMessage(rawMessage: string): Promise<void> {
+  private async sendMessage(
+    rawMessage: string,
+    options?: { clientRequestId?: string; isRetry?: boolean },
+  ): Promise<void> {
     const message = rawMessage.trim();
     if (
       !message ||
@@ -1922,6 +1926,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     // Keep the per-chat cap in the extension so students get immediate,
     // predictable feedback without making another request that cannot run.
     if (
+      !options?.isRetry &&
       this.state.currentConversationId &&
       hasReachedStudentMessageLimit(this.state.currentStudentMessageCount)
     ) {
@@ -1932,7 +1937,15 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const nextConversationId = this.state.currentConversationId;
+    const currentConversationId = this.state.currentConversationId;
+    // Transient ids exist only in the sidebar. A retry with the same
+    // client_request_id must omit them so the backend can recover its durable job.
+    const nextConversationId = this.isTransientConversationId(
+      currentConversationId,
+    )
+      ? undefined
+      : currentConversationId;
+    const clientRequestId = options?.clientRequestId ?? randomUUID();
     const schoolIdForSend =
       nextConversationId && this.state.currentConversationSchoolId
         ? this.state.currentConversationSchoolId
@@ -1950,6 +1963,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       role: "user",
       content: message,
       created_at: new Date().toISOString(),
+      client_request_id: clientRequestId,
     };
 
     const isNewConversation = nextConversationId === undefined;
@@ -2035,6 +2049,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           transport: "polling",
           streamingSupported: false,
           content: "",
+          clientRequestId,
         }),
       ),
       sending: true,
@@ -2115,6 +2130,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
       await this.api.sendMentorMessageStream(
         {
+          client_request_id: clientRequestId,
           school_id: schoolIdForSend,
           course_id: courseIdForSend,
           conversation_id: nextConversationId,
@@ -2186,6 +2202,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
                   transport: "events",
                   streamingSupported: true,
                   content: "",
+                  clientRequestId,
                 }),
               ),
               sending: true,
@@ -2387,6 +2404,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     // Legacy queue fallback for older backends without direct streaming.
     try {
       const job = await this.api.sendMentorMessage({
+        client_request_id: clientRequestId,
         school_id: schoolIdForSend,
         course_id: courseIdForSend,
         conversation_id: nextConversationId,
@@ -2513,9 +2531,16 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           ...optimisticMessage,
           state: "failed",
         };
+        const failedChatSummary = {
+          ...optimisticChatSummary,
+          student_message_count: Math.max(
+            0,
+            optimisticChatSummary.student_message_count - 1,
+          ),
+        };
         this.updateState({
           chats: this.upsertChatSummary(
-            this.decorateChatSummary(optimisticChatSummary),
+            this.decorateChatSummary(failedChatSummary),
             optimisticConversationId,
           ),
           currentConversationId: optimisticConversationId,
@@ -2524,8 +2549,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           currentConversationCourseId: courseIdForSend,
           currentConversationAssignmentId: assignmentIdForSend ?? null,
           currentConversationContext: optimisticConversationContext,
-          currentStudentMessageCount:
-            optimisticChatSummary.student_message_count,
+          currentStudentMessageCount: failedChatSummary.student_message_count,
           pendingMentorReply: null,
           sending: false,
           blockedMessage: getMentorAccessBlockedMessage(error),
@@ -2603,9 +2627,16 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         ...input.optimisticMessage,
         state: "failed",
       };
+      const failedChatSummary = {
+        ...input.optimisticChatSummary,
+        student_message_count: Math.max(
+          0,
+          input.optimisticChatSummary.student_message_count - 1,
+        ),
+      };
       this.updateState({
         chats: this.upsertChatSummary(
-          this.decorateChatSummary(input.optimisticChatSummary),
+          this.decorateChatSummary(failedChatSummary),
           input.optimisticConversationId,
         ),
         currentConversationId: input.optimisticConversationId,
@@ -2614,8 +2645,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         currentConversationCourseId: input.courseIdForSend,
         currentConversationAssignmentId: input.assignmentIdForSend ?? null,
         currentConversationContext: input.optimisticConversationContext,
-        currentStudentMessageCount:
-          input.optimisticChatSummary.student_message_count,
+        currentStudentMessageCount: failedChatSummary.student_message_count,
         pendingMentorReply: null,
         sending: false,
         blockedMessage: getMentorAccessBlockedMessage(input.error),
@@ -3111,21 +3141,40 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // Remove the failed message marker and resend
-    const restoredMessage: ConversationMessage = {
-      ...lastFailedMessage,
-      state: undefined,
-    };
+    const transientConversationId = this.isTransientConversationId(
+      this.state.currentConversationId,
+    )
+      ? this.state.currentConversationId
+      : undefined;
+    if (transientConversationId) {
+      this.localChatSummaries.delete(transientConversationId);
+      this.conversationHistoryCache.delete(transientConversationId);
+    }
+
+    // Replace the failed optimistic row with one retried submission. Reusing
+    // the request id lets the backend return an already-committed job safely.
     this.updateState({
-      messages: this.state.messages.map((msg) =>
-        msg.id === lastFailedMessage.id ? restoredMessage : msg,
+      chats: transientConversationId
+        ? this.removeChatSummary(transientConversationId)
+        : this.state.chats,
+      messages: this.state.messages.filter(
+        (msg) => msg.id !== lastFailedMessage.id,
       ),
+      currentConversationId: transientConversationId
+        ? undefined
+        : this.state.currentConversationId,
       errorMessage: undefined,
     });
-    await this.sendMessage(lastFailedMessage.content);
+    await this.sendMessage(lastFailedMessage.content, {
+      clientRequestId: lastFailedMessage.client_request_id,
+      isRetry: true,
+    });
   }
 
   private async cancelPendingMessage(): Promise<void> {
+    if (this.cancellationInFlight) {
+      return;
+    }
     const activeSendRequestToken = this.sendRequestToken;
     const pendingReply = this.state.pendingMentorReply;
     const pendingJobId =
@@ -3136,47 +3185,74 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       pendingReply?.conversationId && pendingReply.conversationId !== "__new__"
         ? pendingReply.conversationId
         : this.state.currentConversationId;
+    const clientRequestId = pendingReply?.clientRequestId;
 
     // Save partial mentor content before stopping the stream
     const partialContent = this.state.pendingMentorReply?.content?.trim();
 
-    this.cancelledSendRequestTokens.add(activeSendRequestToken);
-    this.stopPendingMentorTracking();
-
     if (!this.state.sending && !this.state.pendingMentorReply) {
-      this.cancelledSendRequestTokens.delete(activeSendRequestToken);
       return;
     }
+    const cancelledPartialContext = partialContent
+      ? {
+          content: partialContent,
+          created_at: new Date().toISOString(),
+        }
+      : undefined;
 
-    this.finalizeCancelledMentorReply({
-      conversationId: pendingConversationId,
-      partialContent,
-      source: "manual",
-      updateChats: true,
-    });
+    this.cancellationInFlight = true;
+    try {
+      const result = pendingJobId
+        ? await this.api.cancelMentorJob(
+            pendingJobId,
+            cancelledPartialContext,
+          )
+        : clientRequestId
+          ? await this.api.cancelMentorRequest(
+              clientRequestId,
+              cancelledPartialContext,
+            )
+          : null;
 
-    // Fire-and-forget the server cancel to free backend resources
-    if (pendingJobId) {
+      if (result && result.status !== "cancelled") {
+        // Completion or failure won the race. Reload the durable outcome
+        // instead of falsely replacing it with a cancellation marker.
+        if (
+          pendingConversationId &&
+          !this.isTransientConversationId(pendingConversationId)
+        ) {
+          await this.loadWorkspaceState({
+            conversationId: pendingConversationId,
+            background: true,
+            forceRefreshConversation: true,
+          });
+        }
+        return;
+      }
+
+      this.cancelledSendRequestTokens.add(activeSendRequestToken);
+      this.stopPendingMentorTracking();
+      if (this.state.sending || this.state.pendingMentorReply) {
+        this.finalizeCancelledMentorReply({
+          conversationId: pendingConversationId,
+          partialContent,
+          source: "manual",
+          updateChats: true,
+        });
+      }
       if (pendingConversationId) {
         this.conversationHistoryCache.delete(pendingConversationId);
         this.unreadConversationIds.add(pendingConversationId);
       }
-      this.api
-        .cancelMentorJob(
-          pendingJobId,
-          partialContent
-            ? {
-                content: partialContent,
-                created_at: new Date().toISOString(),
-              }
-            : undefined,
-        )
-        .catch(() => {
-          // Server cancel is best-effort; ignore failures
-        });
+    } catch (error) {
+      this.updateState({
+        errorMessage: `Could not confirm cancellation. ${this.toErrorMessage(error)}`,
+        canRetryConnection: this.isConnectionError(error),
+      });
+    } finally {
+      this.cancelledSendRequestTokens.delete(activeSendRequestToken);
+      this.cancellationInFlight = false;
     }
-
-    this.cancelledSendRequestTokens.delete(activeSendRequestToken);
   }
 
   private createEmptyState(): SidebarState {
@@ -3847,6 +3923,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     content: string;
     failureCode?: string | null;
     errorMessage?: string | null;
+    clientRequestId?: string;
   }): PendingMentorReply {
     return {
       jobId: input.jobId,
@@ -3857,6 +3934,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       content: input.content,
       failureCode: input.failureCode ?? null,
       errorMessage: input.errorMessage ?? null,
+      clientRequestId: input.clientRequestId,
     };
   }
 
@@ -5345,7 +5423,6 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     <div id="root" class="app"></div>
     <script nonce="${nonce}">
       const vscode = acquireVsCodeApi();
-      const MICROUSD_PER_CENT = ${MICROUSD_PER_CENT};
       const MAX_STUDENT_MESSAGES_PER_CHAT = ${MAX_STUDENT_MESSAGES_PER_CHAT};
       const persisted = vscode.getState() || {};
       let state = {
@@ -6331,17 +6408,11 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      function getUsagePercent(usedMicrousd, budgetCents) {
-        if (
-          typeof usedMicrousd !== "number" ||
-          typeof budgetCents !== "number" ||
-          budgetCents <= 0
-        ) {
+      function getUsagePercent(usagePercent) {
+        if (typeof usagePercent !== "number" || !Number.isFinite(usagePercent)) {
           return null;
         }
-        return Math.round(
-          Math.min((usedMicrousd / (budgetCents * MICROUSD_PER_CENT)) * 100, 100),
-        );
+        return Math.max(0, Math.min(Math.round(usagePercent), 100));
       }
 
       function formatUsageResetDate(value) {
@@ -6810,7 +6881,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           return '<div class="subtle">Usage for the current billing period is not available right now.</div>';
         }
 
-        const usagePct = getUsagePercent(state.usage.used_microusd, state.usage.monthly_budget_cents);
+        const usagePct = getUsagePercent(state.usage.usage_percent);
         const progressPct = usagePct ?? 0;
         const usageLabel = usagePct !== null ? usagePct + "% used" : "Usage unavailable";
 

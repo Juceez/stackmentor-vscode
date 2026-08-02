@@ -56,6 +56,7 @@ export type ConversationMessage = {
   content: string;
   created_at?: string | null;
   state?: "cancelled" | "failed" | null;
+  client_request_id?: string;
 };
 
 export type ConversationHistory = {
@@ -161,8 +162,7 @@ export type StudentUsage = {
   id: string;
   school_id: string;
   user_id: string;
-  monthly_budget_cents: number | null;
-  used_microusd: number;
+  usage_percent: number | null;
   used_messages: number;
   used_tokens: number;
   period_start?: string | null;
@@ -596,26 +596,32 @@ export class StackMentorApiClient {
     schoolId?: string;
     courseId?: string;
   }): Promise<ChatSummary[]> {
-    const params = new URLSearchParams();
+    const pageSize = 100;
+    const chats: ChatSummary[] = [];
 
-    if (options?.schoolId) {
-      params.set("school_id", options.schoolId);
-    }
+    for (let offset = 0; ; offset += pageSize) {
+      const params = new URLSearchParams({
+        limit: String(pageSize),
+        offset: String(offset),
+      });
+      if (options?.schoolId) {
+        params.set("school_id", options.schoolId);
+      }
+      if (options?.courseId) {
+        params.set("course_id", options.courseId);
+      }
 
-    if (options?.courseId) {
-      params.set("course_id", options.courseId);
-    }
-
-    const query = params.toString();
-
-    return this.request<unknown>(
-      query ? `/mentor/chats?${query}` : "/mentor/chats",
-    ).then((value) => {
+      const value = await this.request<unknown>(`/mentor/chats?${params}`);
       const items = Array.isArray(value) ? value : [];
-      return items
+      chats.push(
+        ...items
         .map((item) => normalizeChatSummary(item))
-        .filter((item): item is ChatSummary => Boolean(item));
-    });
+        .filter((item): item is ChatSummary => Boolean(item)),
+      );
+      if (items.length < pageSize) {
+        return chats;
+      }
+    }
   }
 
   async getConversationHistory(
@@ -639,6 +645,7 @@ export class StackMentorApiClient {
   }
 
   async sendMentorMessage(input: {
+    client_request_id: string;
     school_id: string;
     course_id: string;
     conversation_id?: string;
@@ -744,6 +751,22 @@ export class StackMentorApiClient {
     }
   }
 
+  async cancelMentorRequest(
+    clientRequestId: string,
+    cancelledPartialContext?: CancelledPartialContext,
+  ): Promise<MentorJobStatusResponse | null> {
+    const result = await this.request<MentorJobStatusResponse | null>(
+      `/mentor/requests/${encodeURIComponent(clientRequestId)}/cancel`,
+      {
+        method: "POST",
+        body: cancelledPartialContext
+          ? { cancelled_partial_context: cancelledPartialContext }
+          : undefined,
+      },
+    );
+    return result ?? null;
+  }
+
   private async streamMentorJobEventsOnce(
     path: string,
     onEvent: (event: MentorJobEventResponse) => void | Promise<void>,
@@ -846,6 +869,7 @@ export class StackMentorApiClient {
 
   async sendMentorMessageStream(
     input: {
+      client_request_id: string;
       school_id: string;
       course_id: string;
       conversation_id?: string;

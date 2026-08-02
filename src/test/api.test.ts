@@ -427,6 +427,7 @@ suite("StackMentor API helpers", () => {
 
       await client.sendMentorMessageStream(
         {
+          client_request_id: "request-1",
           school_id: "school-1",
           course_id: "course-1",
           message: "Help",
@@ -469,9 +470,143 @@ suite("StackMentor API helpers", () => {
       await client.listChats({ courseId: "course-1" });
 
       assert.deepStrictEqual(calls, [
-        "GET http://127.0.0.1:8000/mentor/chats",
-        "GET http://127.0.0.1:8000/mentor/chats?course_id=course-1",
+        "GET http://127.0.0.1:8000/mentor/chats?limit=100&offset=0",
+        "GET http://127.0.0.1:8000/mentor/chats?limit=100&offset=0&course_id=course-1",
       ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("StackMentorApiClient reads the public student usage percentage", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      assert.strictEqual(
+        input.toString(),
+        "http://127.0.0.1:8000/schools/school-1/student-usage-limits",
+      );
+      assert.strictEqual(
+        new Headers(init?.headers).get("Authorization"),
+        "Bearer access-token",
+      );
+
+      return new Response(
+        JSON.stringify({
+          id: "usage-1",
+          school_id: "school-1",
+          user_id: "user-1",
+          period_start: "2026-08-01",
+          period_end: "2026-09-01",
+          usage_percent: 25,
+          used_messages: 2,
+          used_tokens: 100,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => ({
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          userId: "user-1",
+          email: "student@example.com",
+        }),
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+
+      const usage = await client.getStudentUsage("school-1");
+
+      assert.deepStrictEqual(usage, {
+        id: "usage-1",
+        school_id: "school-1",
+        user_id: "user-1",
+        period_start: "2026-08-01",
+        period_end: "2026-09-01",
+        usage_percent: 25,
+        used_messages: 2,
+        used_tokens: 100,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("StackMentorApiClient follows bounded mentor chat pages", async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = input.toString();
+      calls.push(url);
+      const rows = url.includes("offset=0")
+        ? Array.from({ length: 100 }, (_, index) => ({
+            id: `chat-${index}`,
+            school_id: "school-1",
+            course_id: "course-1",
+            title: `Chat ${index}`,
+            student_message_count: 1,
+          }))
+        : [];
+      return new Response(JSON.stringify(rows), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => null,
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+
+      const chats = await client.listChats();
+      assert.strictEqual(chats.length, 100);
+      assert.deepStrictEqual(calls, [
+        "http://127.0.0.1:8000/mentor/chats?limit=100&offset=0",
+        "http://127.0.0.1:8000/mentor/chats?limit=100&offset=100",
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("StackMentorApiClient cancels by request id before a job id exists", async () => {
+    let requestUrl = "";
+    let requestBody = "";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      requestUrl = input.toString();
+      requestBody = String(init?.body ?? "");
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => null,
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+
+      const result = await client.cancelMentorRequest("request/1", {
+        content: "partial",
+      });
+      assert.strictEqual(result, null);
+      assert.strictEqual(
+        requestUrl,
+        "http://127.0.0.1:8000/mentor/requests/request%2F1/cancel",
+      );
+      assert.deepStrictEqual(JSON.parse(requestBody), {
+        cancelled_partial_context: { content: "partial" },
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }

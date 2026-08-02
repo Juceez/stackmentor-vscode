@@ -69,9 +69,9 @@ suite("StackMentor extension helpers", () => {
   });
 
   test("enforces the per-chat student message limit", () => {
-    assert.strictEqual(hasReachedStudentMessageLimit(9), false);
-    assert.strictEqual(hasReachedStudentMessageLimit(10), true);
-    assert.strictEqual(hasReachedStudentMessageLimit(11), true);
+    assert.strictEqual(hasReachedStudentMessageLimit(19), false);
+    assert.strictEqual(hasReachedStudentMessageLimit(20), true);
+    assert.strictEqual(hasReachedStudentMessageLimit(21), true);
   });
 
   test("keeps a visible transient conversation during background refresh", () => {
@@ -133,6 +133,10 @@ suite("StackMentor extension helpers", () => {
     assert.strictEqual(
       isRetryableMentorSendError(new ApiError(403, "Not allowed")),
       false,
+    );
+    assert.strictEqual(
+      isRetryableMentorSendError(new Error("network connection closed")),
+      true,
     );
   });
 
