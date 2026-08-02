@@ -613,7 +613,11 @@ suite("StackMentor API helpers", () => {
   });
 
   test("StackMentorApiClient parses mentor job event streams with text deltas", async () => {
-    const receivedEvents: Array<{ event: string; delta: string | null | undefined }> = [];
+    const receivedEvents: Array<{
+      event: string;
+      delta: string | null | undefined;
+      reset: boolean | undefined;
+    }> = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => {
       const stream = new ReadableStream<Uint8Array>({
@@ -624,7 +628,7 @@ suite("StackMentor API helpers", () => {
               [
                 'event: job.snapshot',
                 'id: 1',
-                'data: {"event":"job.snapshot","job":{"id":"job-1","conversation_id":"conversation-1","user_message_id":"user-1","status":"processing","stage":"generating","attempt_count":1},"streaming_supported":true,"output_text_delta":null}',
+                'data: {"event":"job.snapshot","job":{"id":"job-1","conversation_id":"conversation-1","user_message_id":"user-1","status":"processing","stage":"generating","attempt_count":2},"streaming_supported":true,"output_text_delta":null,"reset_output":true}',
                 "",
                 'event: job.updated',
                 'id: 2',
@@ -659,13 +663,14 @@ suite("StackMentor API helpers", () => {
         receivedEvents.push({
           event: event.event,
           delta: event.output_text_delta,
+          reset: event.reset_output,
         });
       });
 
       assert.deepStrictEqual(receivedEvents, [
-        { event: "job.snapshot", delta: null },
-        { event: "job.updated", delta: "Hello" },
-        { event: "job.completed", delta: " there" },
+        { event: "job.snapshot", delta: null, reset: true },
+        { event: "job.updated", delta: "Hello", reset: undefined },
+        { event: "job.completed", delta: " there", reset: undefined },
       ]);
     } finally {
       globalThis.fetch = originalFetch;

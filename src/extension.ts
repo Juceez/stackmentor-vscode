@@ -2213,7 +2213,9 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           }
 
           if (event.event === "job.updated") {
-            const currentContent = this.state.pendingMentorReply?.content ?? "";
+            const currentContent = event.reset_output
+              ? ""
+              : (this.state.pendingMentorReply?.content ?? "");
             const nextContent =
               currentContent + (event.output_text_delta ?? "");
             const nextPendingReply = this.trackPendingReply(
@@ -2829,9 +2831,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             return;
           }
 
-          const currentContent =
-            this.pendingRepliesByConversationId.get(conversationId)?.content ??
-            "";
+          const currentContent = event.reset_output
+            ? ""
+            : (this.pendingRepliesByConversationId.get(conversationId)?.content ??
+              "");
           const nextContent = `${currentContent}${event.output_text_delta ?? ""}`;
 
           const pendingReply = this.trackPendingReply(

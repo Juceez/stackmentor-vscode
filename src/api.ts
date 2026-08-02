@@ -132,6 +132,7 @@ export type MentorJobEventResponse = {
   job: MentorJobStatusResponse;
   streaming_supported: boolean;
   output_text_delta?: string | null;
+  reset_output?: boolean;
   context_request?: MentorContextRequest | null;
 };
 
