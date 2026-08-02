@@ -6,6 +6,7 @@ import {
   buildCompletedMentorMessage,
   buildActiveEditorCodeContext,
   buildFileContextFromText,
+  buildBoundedRequestedFileContext,
   extractOrderedListStart,
   extractConcreteFilePathHints,
   getFriendlyAuthErrorMessage,
@@ -27,6 +28,8 @@ import {
   getStreamingRevealDelayMs,
   splitStreamingRevealUnits,
   parseStoredSession,
+  parseWebviewIncomingMessage,
+  isMentorContextRequestAllowed,
 } from "../extension";
 
 suite("StackMentor extension helpers", () => {
@@ -426,7 +429,7 @@ suite("StackMentor extension helpers", () => {
     });
   });
 
-  test("keeps an absolute path when the file is outside the workspace", () => {
+  test("redacts directory names when the file is outside the workspace", () => {
     const context = buildActiveEditorCodeContext({
       documentPath: "C:\\other\\scratch.ts",
       workspaceFolderPath: "C:\\repo",
@@ -434,7 +437,7 @@ suite("StackMentor extension helpers", () => {
     });
 
     assert.deepStrictEqual(context, {
-      file_path: "C:/other/scratch.ts",
+      file_path: "scratch.ts",
       selected_text: null,
       selection_start_line: null,
       selection_end_line: null,
@@ -481,6 +484,16 @@ suite("StackMentor extension helpers", () => {
     });
   });
 
+  test("prefixes workspace-relative paths in a multi-root workspace", () => {
+    const context = buildActiveEditorCodeContext({
+      documentPath: "C:\\repo\\src\\app.ts",
+      workspaceFolderPath: "C:\\repo",
+      workspaceFolderLabel: "course-project",
+    });
+
+    assert.strictEqual(context?.file_path, "course-project/src/app.ts");
+  });
+
   test("preserves an empty file as an available empty preview", () => {
     const context = buildFileContextFromText({
       documentPath: "C:\\repo\\src\\empty.ts",
@@ -492,6 +505,95 @@ suite("StackMentor extension helpers", () => {
 
     assert.strictEqual(context?.content, "");
     assert.strictEqual(context?.total_lines, 1);
+  });
+
+  test("bounds visible file previews while preserving total line metadata", () => {
+    const lines = Array.from({ length: 1_200 }, (_, index) => `line ${index + 1}`);
+    const context = buildFileContextFromText({
+      documentPath: "C:\\repo\\src\\large.ts",
+      workspaceFolderPath: "C:\\repo",
+      text: lines.join("\n"),
+    });
+
+    assert.strictEqual(context?.content?.split("\n").length, 1_000);
+    assert.strictEqual(context?.total_lines, 1_200);
+  });
+
+  test("validates webview messages at runtime", () => {
+    assert.deepStrictEqual(
+      parseWebviewIncomingMessage({ type: "sendMessage", message: "Help" }),
+      { type: "sendMessage", message: "Help" },
+    );
+    assert.strictEqual(parseWebviewIncomingMessage(null), null);
+    assert.strictEqual(
+      parseWebviewIncomingMessage({ type: "openChat", conversationId: "" }),
+      null,
+    );
+    assert.strictEqual(
+      parseWebviewIncomingMessage({
+        type: "sendMessage",
+        message: "x".repeat(20_001),
+      }),
+      null,
+    );
+  });
+
+  test("allows only trusted non-sensitive paths advertised for the job", () => {
+    assert.strictEqual(
+      isMentorContextRequestAllowed({
+        workspaceTrusted: true,
+        requestedPath: "src/app.ts",
+        allowedPaths: ["src/app.ts"],
+      }),
+      true,
+    );
+    assert.strictEqual(
+      isMentorContextRequestAllowed({
+        workspaceTrusted: false,
+        requestedPath: "src/app.ts",
+        allowedPaths: ["src/app.ts"],
+      }),
+      false,
+    );
+    assert.strictEqual(
+      isMentorContextRequestAllowed({
+        workspaceTrusted: true,
+        requestedPath: ".env",
+        allowedPaths: [".env"],
+      }),
+      false,
+    );
+    assert.strictEqual(
+      isMentorContextRequestAllowed({
+        workspaceTrusted: true,
+        requestedPath: "secrets/config.ts",
+        allowedPaths: ["secrets/config.ts"],
+      }),
+      false,
+    );
+    assert.strictEqual(
+      isMentorContextRequestAllowed({
+        workspaceTrusted: true,
+        requestedPath: "src/other.ts",
+        allowedPaths: ["src/app.ts"],
+      }),
+      false,
+    );
+  });
+
+  test("caps a requested opened-tab range to 1,000 lines", () => {
+    const text = Array.from({ length: 1_500 }, (_, index) => `line ${index + 1}`).join(
+      "\n",
+    );
+    const context = buildBoundedRequestedFileContext({
+      text,
+      startLine: 100,
+      endLine: 1_000,
+    });
+
+    assert.strictEqual(context.content.split("\n").length, 1_000);
+    assert.strictEqual(context.content.startsWith("line 100\n"), true);
+    assert.strictEqual(context.totalLines, 1_500);
   });
 
   test("extracts concrete file path hints from the student message", () => {

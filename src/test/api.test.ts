@@ -1,6 +1,7 @@
 import * as assert from "assert";
 
 import {
+  ApiError,
   normalizeConversationHistory,
   trimConversationMessagesForSidebar,
   normalizeUserProfile,
@@ -356,6 +357,37 @@ suite("StackMentor API helpers", () => {
     }
   });
 
+  test("StackMentorApiClient can confirm logout after local session cleanup", async () => {
+    let authorizationHeader: string | null = null;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL, init?: RequestInit) => {
+      authorizationHeader = new Headers(init?.headers).get("Authorization");
+      return new Response(JSON.stringify({ message: "Signed out" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => null,
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+      await client.logout({
+        accessToken: "logout-token",
+        refreshToken: "refresh-token",
+        userId: "user-1",
+        email: "student@example.com",
+      });
+
+      assert.strictEqual(authorizationHeader, "Bearer logout-token");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("StackMentorApiClient refreshes before opening a mentor stream after a 401", async () => {
     let session: AuthSession | null = {
       accessToken: "expired-token",
@@ -607,6 +639,54 @@ suite("StackMentor API helpers", () => {
       assert.deepStrictEqual(JSON.parse(requestBody), {
         cancelled_partial_context: { content: "partial" },
       });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("direct mentor streaming rejects a connection that closes before terminal state", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              [
+                "event: job.snapshot",
+                'data: {"event":"job.snapshot","job":{"id":"job-1","conversation_id":"conversation-1","user_message_id":"user-1","status":"processing","stage":"generating","attempt_count":1},"streaming_supported":true}',
+                "",
+              ].join("\n"),
+            ),
+          );
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const client = new StackMentorApiClient({
+        getBaseUrl: () => "http://127.0.0.1:8000",
+        getSession: async () => null,
+        saveSession: async () => {},
+        clearSession: async () => {},
+      });
+
+      await assert.rejects(
+        client.sendMentorMessageStream(
+          {
+            client_request_id: "request-1",
+            school_id: "school-1",
+            course_id: "course-1",
+            message: "Help",
+          },
+          () => {},
+        ),
+        (error: unknown) => error instanceof ApiError && error.status === 502,
+      );
     } finally {
       globalThis.fetch = originalFetch;
     }

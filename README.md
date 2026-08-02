@@ -59,12 +59,12 @@ The extension sends mentor requests to the configured StackMentor backend. Depen
 
 - The student's message, selected school/course/assignment, and conversation history
 - The active file path, selected text, and nearby code around the selection
-- Content from visible text editors
-- Paths for up to five opened text tabs, including tabs that are not visible
+- Bounded content from visible text editors in the trusted workspace
+- Workspace-relative paths for up to five opened text tabs, including tabs that are not visible
 - Files explicitly mentioned in the student's message
 - A bounded code range from an opened file when Scout requests additional context
 
-During its normal workspace-context collection, the extension skips common sensitive paths and files, including `.env` files, credentials, secrets, private keys, and certificate files. When the VS Code workspace is untrusted, the extension does not proactively collect project file context. A mentor job may still request a bounded range from a text file that is already open in VS Code.
+The extension skips common sensitive paths and files, including `.env` files, credentials, secrets, private keys, and certificate files. When the VS Code workspace is untrusted, the extension does not collect or respond with project file context. A mentor job can request a bounded range only from one of the opened workspace tabs whose path was included with that request.
 
 The backend stores account and chat data and may process mentor context using its configured model providers. The backend operator is responsible for access control, provider configuration, retention, and deletion.
 

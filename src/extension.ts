@@ -75,9 +75,14 @@ const VIEW_CONTAINER_ID = "stackmentor";
 const MAX_CACHED_CONVERSATIONS = 50;
 const LEAKED_CODE_PLACEHOLDER_PATTERN = /@@CODE_?\d+@@/g;
 const PROTECTED_CONTEXT_FILE_PATTERN =
-  /(^|\/)(?:\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|[^/]+\.(?:pem|key|p12|pfx|jks))$/i;
+  /(^|\/)(?:\.git|\.ssh|\.aws|\.azure|\.gnupg|\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|[^/]+\.(?:pem|key|p12|pfx|jks))(?:\/|$)/i;
 const MAX_FORMATTED_MESSAGE_LENGTH = 40_000;
 const CONVERSATION_HISTORY_LOAD_TIMEOUT_MS = 15_000;
+const MAX_CONTEXT_PREVIEW_LINES = 1_000;
+const MAX_CONTEXT_PREVIEW_CHARACTERS = 40_000;
+const CANCELLATION_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_WEBVIEW_MESSAGE_LENGTH = 20_000;
+const MAX_WEBVIEW_ID_LENGTH = 256;
 export const MAX_STUDENT_MESSAGES_PER_CHAT = 20;
 
 export function hasReachedStudentMessageLimit(messageCount: number): boolean {
@@ -153,7 +158,7 @@ type SidebarState = {
   usage: StudentUsage | null;
 };
 
-type WebviewIncomingMessage =
+export type WebviewIncomingMessage =
   | { type: "ready" }
   | { type: "setConversationVisibility"; isVisible: boolean }
   | { type: "login"; email: string; password: string }
@@ -170,6 +175,80 @@ type WebviewIncomingMessage =
   | { type: "cancelMessage" }
   | { type: "sendMessage"; message: string }
   | { type: "retryMessage" };
+
+export function parseWebviewIncomingMessage(
+  payload: unknown,
+): WebviewIncomingMessage | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const candidate = payload as Record<string, unknown>;
+  const type = candidate.type;
+  if (typeof type !== "string") {
+    return null;
+  }
+
+  const simpleTypes = new Set([
+    "ready",
+    "openSignUp",
+    "forgotPassword",
+    "signOut",
+    "refresh",
+    "retryConnection",
+    "newChat",
+    "cancelMessage",
+    "retryMessage",
+  ]);
+  if (simpleTypes.has(type)) {
+    return { type } as WebviewIncomingMessage;
+  }
+
+  if (type === "setConversationVisibility") {
+    return typeof candidate.isVisible === "boolean"
+      ? { type, isVisible: candidate.isVisible }
+      : null;
+  }
+
+  if (type === "login") {
+    return typeof candidate.email === "string" &&
+      candidate.email.length <= 320 &&
+      typeof candidate.password === "string" &&
+      candidate.password.length <= 4_096
+      ? { type, email: candidate.email, password: candidate.password }
+      : null;
+  }
+
+  if (type === "sendMessage") {
+    return typeof candidate.message === "string" &&
+      candidate.message.length <= MAX_WEBVIEW_MESSAGE_LENGTH
+      ? { type, message: candidate.message }
+      : null;
+  }
+
+  const validId = (value: unknown): value is string =>
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= MAX_WEBVIEW_ID_LENGTH;
+
+  if (type === "selectSchool" && validId(candidate.schoolId)) {
+    return { type, schoolId: candidate.schoolId };
+  }
+  if (type === "selectCourse" && validId(candidate.courseId)) {
+    return { type, courseId: candidate.courseId };
+  }
+  if (type === "openChat" && validId(candidate.conversationId)) {
+    return { type, conversationId: candidate.conversationId };
+  }
+  if (
+    type === "selectAssignment" &&
+    (candidate.assignmentId === null || validId(candidate.assignmentId))
+  ) {
+    return { type, assignmentId: candidate.assignmentId };
+  }
+
+  return null;
+}
 
 let activeProvider: StackMentorSidebarProvider | null = null;
 const ACTIVE_SELECTION_SURROUNDING_LINE_PADDING = 30;
@@ -238,9 +317,68 @@ export function isProtectedContextPath(value: string): boolean {
   return PROTECTED_CONTEXT_FILE_PATTERN.test(normalized);
 }
 
+function normalizeContextPath(value: string): string {
+  let normalized = value.replace(/\\/g, "/").trim();
+  while (
+    normalized.length >= 2 &&
+    normalized[0] === normalized[normalized.length - 1] &&
+    ['"', "'", "`"].includes(normalized[0])
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  return normalized.replace(/\/{2,}/g, "/").toLowerCase();
+}
+
+export function isMentorContextRequestAllowed(input: {
+  workspaceTrusted: boolean;
+  requestedPath: string;
+  allowedPaths: Iterable<string>;
+}): boolean {
+  if (!input.workspaceTrusted || isProtectedContextPath(input.requestedPath)) {
+    return false;
+  }
+  const requestedPath = normalizeContextPath(input.requestedPath);
+  return Array.from(input.allowedPaths).some(
+    (allowedPath) => normalizeContextPath(allowedPath) === requestedPath,
+  );
+}
+
+export function buildBoundedRequestedFileContext(input: {
+  text: string;
+  startLine?: number | null;
+  endLine?: number | null;
+}): { content: string; totalLines: number } {
+  const lines = sanitizePromptContextText(input.text).split(/\r?\n/);
+  const requestedStart =
+    typeof input.startLine === "number" && Number.isFinite(input.startLine)
+      ? Math.floor(input.startLine)
+      : 1;
+  const start = Math.min(lines.length, Math.max(1, requestedStart));
+  const requestedEnd =
+    typeof input.endLine === "number" &&
+    Number.isFinite(input.endLine) &&
+    input.endLine >= start
+      ? Math.floor(input.endLine)
+      : start + MAX_CONTEXT_PREVIEW_LINES - 1;
+  const end = Math.min(
+    lines.length,
+    requestedEnd,
+    start + MAX_CONTEXT_PREVIEW_LINES - 1,
+  );
+  return {
+    content: lines
+      .slice(start - 1, end)
+      .join("\n")
+      .trim()
+      .slice(0, MAX_CONTEXT_PREVIEW_CHARACTERS),
+    totalLines: lines.length,
+  };
+}
+
 export function buildActiveEditorCodeContext(input: {
   documentPath: string;
   workspaceFolderPath?: string;
+  workspaceFolderLabel?: string;
   selectedText?: string | null;
   fullDocumentText?: string | null;
   selectionStartLine?: number | null;
@@ -254,7 +392,9 @@ export function buildActiveEditorCodeContext(input: {
     return null;
   }
 
-  let normalizedPath = normalizedDocumentPath;
+  // Outside-workspace paths can expose usernames and private directory names.
+  // Keep only the filename while still telling Scout which active file is in use.
+  let normalizedPath = path.basename(normalizedDocumentPath);
   if (input.workspaceFolderPath) {
     const workspaceFolderPath = input.workspaceFolderPath.replace(/\\/g, "/");
     const relativePath = path
@@ -265,13 +405,18 @@ export function buildActiveEditorCodeContext(input: {
       relativePath !== "." &&
       !relativePath.startsWith("../")
     ) {
-      normalizedPath = relativePath;
+      normalizedPath = input.workspaceFolderLabel
+        ? `${input.workspaceFolderLabel}/${relativePath}`
+        : relativePath;
     }
   }
 
   const sanitizedSelection =
     typeof input.selectedText === "string"
-      ? sanitizePromptContextText(input.selectedText)
+      ? sanitizePromptContextText(input.selectedText).slice(
+          0,
+          MAX_CONTEXT_PREVIEW_CHARACTERS,
+        )
       : "";
   const normalizedSelectionStartLine =
     typeof input.selectionStartLine === "number" &&
@@ -300,14 +445,19 @@ export function buildActiveEditorCodeContext(input: {
       1,
       normalizedSelectionStartLine - ACTIVE_SELECTION_SURROUNDING_LINE_PADDING,
     );
-    const sliceEnd = Math.min(
+    const requestedSliceEnd = Math.min(
       lines.length,
       normalizedSelectionEndLine + ACTIVE_SELECTION_SURROUNDING_LINE_PADDING,
+    );
+    const sliceEnd = Math.min(
+      requestedSliceEnd,
+      sliceStart + MAX_CONTEXT_PREVIEW_LINES - 1,
     );
     const excerpt = lines
       .slice(sliceStart - 1, sliceEnd)
       .join("\n")
-      .trim();
+      .trim()
+      .slice(0, MAX_CONTEXT_PREVIEW_CHARACTERS);
     if (excerpt) {
       surroundingCode = excerpt;
       surroundingStartLine = sliceStart;
@@ -329,6 +479,7 @@ export function buildActiveEditorCodeContext(input: {
 export function buildFileContextFromText(input: {
   documentPath: string;
   workspaceFolderPath?: string;
+  workspaceFolderLabel?: string;
   text: string;
   isActive?: boolean;
   source?: "open_tab" | "workspace_hint";
@@ -336,19 +487,25 @@ export function buildFileContextFromText(input: {
   const activeCodeContext = buildActiveEditorCodeContext({
     documentPath: input.documentPath,
     workspaceFolderPath: input.workspaceFolderPath,
+    workspaceFolderLabel: input.workspaceFolderLabel,
   });
   if (!activeCodeContext) {
     return null;
   }
 
   const sanitizedContent = sanitizePromptContextText(input.text);
+  const allLines = sanitizedContent.split(/\r?\n/);
+  const boundedContent = allLines
+    .slice(0, MAX_CONTEXT_PREVIEW_LINES)
+    .join("\n")
+    .slice(0, MAX_CONTEXT_PREVIEW_CHARACTERS);
   return {
     file_path: activeCodeContext.file_path,
     is_active: input.isActive ?? false,
     // An empty string means the document was read successfully and contains
     // no code. Keep it distinct from null, which means no preview was available.
-    content: sanitizedContent,
-    total_lines: sanitizedContent.split(/\r?\n/).length,
+    content: boundedContent,
+    total_lines: allLines.length,
     source: input.source ?? "open_tab",
   };
 }
@@ -408,9 +565,16 @@ export async function buildResolvedSymbolContexts(
   for (const candidatePath of candidateFilePaths.slice(0, 5)) {
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       try {
+        const candidateSegments = candidatePath.split("/");
+        if ((vscode.workspace.workspaceFolders?.length ?? 0) > 1) {
+          if (candidateSegments[0]?.toLowerCase() !== folder.name.toLowerCase()) {
+            continue;
+          }
+          candidateSegments.shift();
+        }
         const uri = vscode.Uri.joinPath(
           folder.uri,
-          ...candidatePath.split("/"),
+          ...candidateSegments,
         );
         const document = await vscode.workspace.openTextDocument(uri);
         documents.set(document.uri.toString(), document);
@@ -453,21 +617,33 @@ export async function buildResolvedSymbolContexts(
         "targetUri" in definition ? definition.targetUri : definition.uri;
       const range =
         "targetRange" in definition ? definition.targetRange : definition.range;
-      const target = await vscode.workspace.openTextDocument(uri);
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+      if (!workspaceFolder || isProtectedContextPath(uri.fsPath)) {
+        continue;
+      }
+      let target: vscode.TextDocument;
+      try {
+        target = await vscode.workspace.openTextDocument(uri);
+      } catch {
+        continue;
+      }
       const startLine = Math.max(0, range.start.line - 12);
       const endLine = Math.min(target.lineCount, range.end.line + 13);
       const content = target
         .getText(new vscode.Range(startLine, 0, endLine, 0))
-        .trim();
+        .trim()
+        .slice(0, MAX_CONTEXT_PREVIEW_CHARACTERS);
       if (!content) {
         continue;
       }
 
-      const workspaceFolder =
-        vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath;
       const normalizedPath = buildActiveEditorCodeContext({
         documentPath: uri.fsPath,
-        workspaceFolderPath: workspaceFolder,
+        workspaceFolderPath: workspaceFolder.uri.fsPath,
+        workspaceFolderLabel:
+          (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+            ? workspaceFolder.name
+            : undefined,
       })?.file_path;
       if (!normalizedPath) {
         continue;
@@ -502,13 +678,20 @@ export function buildOpenTabContexts(): OpenTabContext[] {
           return null;
         }
 
-        const workspaceFolderPath = vscode.workspace.getWorkspaceFolder(
-          document.uri,
-        )?.uri.fsPath;
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+        if (!workspaceFolder) {
+          return null;
+        }
+        const workspaceFolderPath = workspaceFolder.uri.fsPath;
+        const workspaceFolderLabel =
+          (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+            ? workspaceFolder.name
+            : undefined;
 
         const activeCodeContext = buildActiveEditorCodeContext({
           documentPath,
           workspaceFolderPath,
+          workspaceFolderLabel,
         });
 
         if (!activeCodeContext) {
@@ -518,6 +701,7 @@ export function buildOpenTabContexts(): OpenTabContext[] {
         return buildFileContextFromText({
           documentPath,
           workspaceFolderPath,
+          workspaceFolderLabel,
           text: document.getText(),
           isActive: editor === vscode.window.activeTextEditor,
           source: "open_tab",
@@ -554,19 +738,30 @@ export function buildOpenedTabPaths(): string[] {
         continue;
       }
 
-      const documentPath =
-        tab.input.uri.scheme === "file"
-          ? tab.input.uri.fsPath
-          : tab.input.uri.toString();
-      if (!documentPath || seenPaths.has(documentPath)) {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(tab.input.uri);
+      if (!workspaceFolder || tab.input.uri.scheme !== "file") {
         continue;
       }
-      if (isProtectedContextPath(documentPath)) {
+      const folderRelativePath = path
+        .relative(workspaceFolder.uri.fsPath, tab.input.uri.fsPath)
+        .replace(/\\/g, "/");
+      const relativePath =
+        (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+          ? `${workspaceFolder.name}/${folderRelativePath}`
+          : folderRelativePath;
+      if (
+        !folderRelativePath ||
+        folderRelativePath === "." ||
+        folderRelativePath.startsWith("../") ||
+        path.posix.isAbsolute(folderRelativePath) ||
+        seenPaths.has(relativePath) ||
+        isProtectedContextPath(relativePath)
+      ) {
         continue;
       }
 
-      paths.push(documentPath);
-      seenPaths.add(documentPath);
+      paths.push(relativePath);
+      seenPaths.add(relativePath);
       if (paths.length >= 5) {
         return paths;
       }
@@ -951,6 +1146,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     LocalCancelledPartialContext
   >();
   private submittedContextRequestIds = new Set<string>();
+  private allowedOpenedTabPathsByJobId = new Map<string, Set<string>>();
   private unreadConversationIds = new Set<string>();
   private pendingRepliesByConversationId = new Map<
     string,
@@ -969,6 +1165,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   private studentUsageRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionApiBaseUrl: string | null = null;
   private sessionWritesBlocked = false;
+  private disposed = false;
 
   private htmlCache: string | null = null;
   private stateVersion = 0;
@@ -1017,9 +1214,12 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
   /** @internal */
   public dispose(): void {
+    this.disposed = true;
     this.stopPendingMentorTracking();
     this.clearSessionKeepaliveRefresh();
     this.clearStudentUsageRefresh();
+    this.backgroundTrackedJobIds.clear();
+    this.allowedOpenedTabPathsByJobId.clear();
   }
 
   async bootstrap(): Promise<void> {
@@ -1047,7 +1247,12 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     };
     view.webview.html = this.getHtml(view.webview);
     view.webview.onDidReceiveMessage(
-      async (message: WebviewIncomingMessage) => {
+      async (payload: unknown) => {
+        const message = parseWebviewIncomingMessage(payload);
+        if (!message) {
+          outputChannel.appendLine("Ignored an invalid StackMentor webview message.");
+          return;
+        }
         await this.handleMessage(message);
       },
       undefined,
@@ -1056,6 +1261,13 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async refresh(): Promise<void> {
+    if (this.isChatNavigationLocked()) {
+      this.updateState({
+        errorMessage: "Wait for the current reply to finish or stop it before refreshing.",
+        canRetryConnection: false,
+      });
+      return;
+    }
     if (!this.session) {
       this.clearSessionKeepaliveRefresh();
       this.updateState({
@@ -1070,6 +1282,13 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async startNewChat(): Promise<void> {
+    if (this.isChatNavigationLocked()) {
+      this.updateState({
+        errorMessage: "Wait for the current reply to finish or stop it before starting a new chat.",
+        canRetryConnection: false,
+      });
+      return;
+    }
     this.bumpWorkspaceStateEpoch();
     this.stopPendingMentorTracking();
     this.clearCancelledPartialContext(this.state.currentConversationId);
@@ -1091,29 +1310,30 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   async signOut(): Promise<void> {
-    if (this.session) {
+    const sessionToLogout = this.session;
+    let remoteLogoutError: unknown;
+    if (sessionToLogout) {
       this.sessionWritesBlocked = true;
-      try {
-        await this.api.logout();
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 401) {
-          await this.clearLocalSession();
-          this.updateState({
-            errorMessage: this.toErrorMessage(error),
-            canRetryConnection: false,
-          });
-          return;
-        }
-        this.sessionWritesBlocked = false;
-        this.updateState({
-          errorMessage: this.toErrorMessage(error),
-          canRetryConnection: this.isConnectionError(error),
-        });
-        return;
-      }
     }
 
+    // Clear the device first so a slow or unavailable server can never leave a
+    // student signed in after they used the Sign out action.
     await this.clearLocalSession();
+
+    if (sessionToLogout) {
+      try {
+        await this.api.logout(sessionToLogout);
+      } catch (error) {
+        remoteLogoutError = error;
+      }
+    }
+    if (remoteLogoutError) {
+      this.updateState({
+        errorMessage:
+          "You were signed out on this device, but StackMentor could not confirm server-side sign out.",
+        canRetryConnection: false,
+      });
+    }
   }
 
   private async clearLocalSession(): Promise<void> {
@@ -1125,6 +1345,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     this.conversationHistoryCache.clear();
     this.localChatSummaries.clear();
     this.cancelledPartialsByConversationId.clear();
+    this.allowedOpenedTabPathsByJobId.clear();
+    this.submittedContextRequestIds.clear();
     this.unreadConversationIds.clear();
     this.pendingRepliesByConversationId.clear();
     this.completedMentorMessagesByConversationId.clear();
@@ -1634,6 +1856,12 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async selectSchool(schoolId: string): Promise<void> {
+    if (
+      this.isChatNavigationLocked() ||
+      !this.state.schools.some((school) => school.id === schoolId)
+    ) {
+      return;
+    }
     this.stopPendingMentorTracking();
     this.clearCancelledPartialContext(this.state.currentConversationId);
     await this.loadWorkspaceState({
@@ -1645,6 +1873,12 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async selectCourse(courseId: string): Promise<void> {
+    if (
+      this.isChatNavigationLocked() ||
+      !this.state.courses.some((course) => course.id === courseId)
+    ) {
+      return;
+    }
     this.stopPendingMentorTracking();
     this.clearCancelledPartialContext(this.state.currentConversationId);
     await this.loadWorkspaceState({
@@ -1655,6 +1889,15 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async selectAssignment(assignmentId: string | null): Promise<void> {
+    if (
+      this.isChatNavigationLocked() ||
+      (assignmentId !== null &&
+        !this.state.assignments.some(
+          (assignment) => assignment.id === assignmentId,
+        ))
+    ) {
+      return;
+    }
     this.updateState({
       selectedAssignmentId: assignmentId,
       errorMessage: undefined,
@@ -1664,6 +1907,13 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async openChat(conversationId: string): Promise<void> {
+    if (
+      this.isChatNavigationLocked() ||
+      (!this.state.chats.some((chat) => chat.id === conversationId) &&
+        !this.localChatSummaries.has(conversationId))
+    ) {
+      return;
+    }
     if (conversationId === this.state.currentConversationId) {
       const matchingChat =
         this.state.chats.find((chat) => chat.id === conversationId) ??
@@ -2093,20 +2343,37 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       this.getCancelledPartialContextForSend(nextConversationId);
     // Do not read or transmit project files from an untrusted workspace.
     const workspaceIsTrusted = vscode.workspace.isTrusted;
-    const activeCodeContext = workspaceIsTrusted
-      ? this.getActiveEditorCodeContext()
-      : null;
-    const openTabs = workspaceIsTrusted ? buildOpenTabContexts() : [];
-    const openedTabPaths = workspaceIsTrusted ? buildOpenedTabPaths() : [];
-    const workspaceFileContexts = workspaceIsTrusted
-      ? await this.buildWorkspaceHintFileContexts(message, openTabs)
-      : [];
-    const resolvedSymbolContexts = workspaceIsTrusted
-      ? await buildResolvedSymbolContexts(
+    let activeCodeContext: ActiveCodeContext | null = null;
+    let openTabs: OpenTabContext[] = [];
+    let openedTabPaths: string[] = [];
+    let workspaceFileContexts: OpenTabContext[] = [];
+    let resolvedSymbolContexts: OpenTabContext[] = [];
+    if (workspaceIsTrusted) {
+      try {
+        activeCodeContext = this.getActiveEditorCodeContext();
+        openTabs = buildOpenTabContexts();
+        openedTabPaths = buildOpenedTabPaths();
+      } catch {
+        // Editor context is optional. A provider or virtual document failure
+        // must never strand the student's message in a sending state.
+      }
+      try {
+        workspaceFileContexts = await this.buildWorkspaceHintFileContexts(
+          message,
+          openTabs,
+        );
+      } catch {
+        // Continue with the active and visible editor context collected above.
+      }
+      try {
+        resolvedSymbolContexts = await buildResolvedSymbolContexts(
           message,
           workspaceFileContexts.map((context) => context.file_path),
-        )
-      : [];
+        );
+      } catch {
+        // Language tooling is optional and can fail for incomplete projects.
+      }
+    }
     const suppliedContextPaths = new Set([
       ...openTabs.map((tab) => tab.file_path),
       ...workspaceFileContexts.map((tab) => tab.file_path),
@@ -2156,6 +2423,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           if (event.event === "job.snapshot") {
             streamResolvedConversationId = cid;
             streamResolvedJobId = event.job.id;
+            this.rememberAllowedOpenedTabPaths(event.job.id, openedTabPaths);
             if (cancelledPartialContext) {
               this.clearCancelledPartialContext(cid);
             }
@@ -2352,8 +2620,9 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             ),
           });
         }
+        const reconnectPollToken = ++this.pollToken;
         const reconnected = await this.waitForJobEvents(
-          requestToken,
+          reconnectPollToken,
           streamResolvedConversationId ?? optimisticConversationId,
           {
             transport: "sse",
@@ -2380,7 +2649,14 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         });
         return;
       }
-      if (!shouldFallbackToLegacySendTransport(directStreamError)) {
+      const shouldRecoverPreSnapshotStream =
+        directStreamError instanceof ApiError &&
+        directStreamError.status === 502 &&
+        directStreamError.detail.includes("closed before the job finished");
+      if (
+        !shouldFallbackToLegacySendTransport(directStreamError) &&
+        !shouldRecoverPreSnapshotStream
+      ) {
         await this.handleSendMessageFailure({
           error: directStreamError,
           requestToken,
@@ -2400,10 +2676,12 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       if (this.activeJobAbortController === streamAbortController) {
         this.activeJobAbortController = null;
       }
-      // 404 ? streaming endpoint not available, fall through to legacy flow
+      // A missing stream endpoint or a pre-snapshot disconnect is recovered by
+      // the idempotent queue endpoint using the same client request id.
     }
 
     // Legacy queue fallback for older backends without direct streaming.
+    let acceptedLegacyJob: MentorJobResponse | null = null;
     try {
       const job = await this.api.sendMentorMessage({
         client_request_id: clientRequestId,
@@ -2422,6 +2700,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             ? allWorkspaceFileContexts
             : undefined,
       });
+      acceptedLegacyJob = job;
+      this.rememberAllowedOpenedTabPaths(job.job_id, openedTabPaths);
 
       if (cancelledPartialContext) {
         this.clearCancelledPartialContext(job.conversation_id);
@@ -2513,6 +2793,19 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       this.cancelledSendRequestTokens.delete(requestToken);
 
       if (requestToken !== this.sendRequestToken) {
+        return;
+      }
+
+      if (acceptedLegacyJob) {
+        // The request already exists on the backend. Preserve its durable ids
+        // and keep tracking instead of turning it back into a failed local send.
+        this.updateState({
+          sending: true,
+          errorMessage:
+            "Connection to the running reply was interrupted. StackMentor is reconnecting.",
+          canRetryConnection: true,
+        });
+        void this.waitForBackgroundJob(acceptedLegacyJob);
         return;
       }
 
@@ -2727,10 +3020,31 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     const pollIntervalMs = vscode.workspace
       .getConfiguration("stackmentor")
       .get<number>("jobPollIntervalMs", 1500);
+    let consecutiveTrackingFailures = 0;
 
     try {
-      while (true) {
-        const currentJob = await this.api.getMentorJob(job.job_id);
+      while (!this.disposed) {
+        let currentJob;
+        try {
+          currentJob = await this.api.getMentorJob(job.job_id);
+          consecutiveTrackingFailures = 0;
+        } catch {
+          if (
+            !this.session ||
+            !this.backgroundTrackedJobIds.has(job.job_id)
+          ) {
+            return;
+          }
+          consecutiveTrackingFailures += 1;
+          await sleep(
+            Math.min(
+              30_000,
+              Math.max(500, pollIntervalMs) *
+                2 ** Math.min(consecutiveTrackingFailures - 1, 4),
+            ),
+          );
+          continue;
+        }
         const pendingReply = this.pendingRepliesByConversationId.get(
           currentJob.conversation_id,
         );
@@ -2763,6 +3077,14 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             );
           }
           this.clearPendingReply(currentJob.conversation_id);
+          if (this.state.currentConversationId === currentJob.conversation_id) {
+            this.updateState({
+              pendingMentorReply: null,
+              sending: false,
+              errorMessage: undefined,
+              canRetryConnection: false,
+            });
+          }
           if (
             this.state.currentConversationId === currentJob.conversation_id &&
             this.isConversationCurrentlyVisible(currentJob.conversation_id)
@@ -2787,17 +3109,50 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           return;
         }
 
-        if (
-          currentJob.status === "failed" ||
-          currentJob.status === "cancelled"
-        ) {
+        if (currentJob.status === "failed") {
           this.clearPendingReply(currentJob.conversation_id);
+          const failureMessage = getMentorJobErrorMessage({
+            errorMessage: currentJob.last_error,
+            failureCode: currentJob.failure_code,
+          });
+          if (this.state.currentConversationId === currentJob.conversation_id) {
+            this.markLatestUserMessageFailed(currentJob.conversation_id);
+            this.updateState({
+              pendingMentorReply: null,
+              sending: false,
+              blockedMessage: getMentorAccessBlockedMessage(failureMessage),
+              errorMessage: failureMessage,
+              canRetryConnection: false,
+            });
+          } else {
+            this.markConversationUnread(currentJob.conversation_id);
+          }
           // Same as above: preserve current conversation messages when a
-          // background job for another conversation fails or is cancelled.
+          // background job for another conversation fails.
           await this.loadWorkspaceState({
             background: true,
             forceRefreshConversation: true,
           });
+          return;
+        }
+
+        if (currentJob.status === "cancelled") {
+          if (this.state.currentConversationId === currentJob.conversation_id) {
+            const latestMentorMessage = [...this.state.messages]
+              .reverse()
+              .find((message) => message.role === "mentor");
+            if (latestMentorMessage?.state !== "cancelled") {
+              this.finalizeCancelledMentorReply({
+                conversationId: currentJob.conversation_id,
+                partialContent: pendingReply?.content,
+                source: "background",
+              });
+            }
+          } else {
+            this.clearPendingReply(currentJob.conversation_id);
+            this.markConversationUnread(currentJob.conversation_id);
+          }
+          this.conversationHistoryCache.delete(currentJob.conversation_id);
           return;
         }
 
@@ -3013,9 +3368,27 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     const pollIntervalMs = vscode.workspace
       .getConfiguration("stackmentor")
       .get<number>("jobPollIntervalMs", 1500);
+    let consecutiveTrackingFailures = 0;
 
     while (currentToken === this.pollToken) {
-      const job = await this.api.getMentorJob(jobId);
+      let job;
+      try {
+        job = await this.api.getMentorJob(jobId);
+        consecutiveTrackingFailures = 0;
+      } catch (error) {
+        consecutiveTrackingFailures += 1;
+        if (consecutiveTrackingFailures > 8) {
+          throw error;
+        }
+        await sleep(
+          Math.min(
+            10_000,
+            Math.max(500, pollIntervalMs) *
+              2 ** Math.min(consecutiveTrackingFailures - 1, 3),
+          ),
+        );
+        continue;
+      }
 
       if (currentToken !== this.pollToken) {
         return;
@@ -3135,6 +3508,14 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     this.activeJobAbortController = null;
   }
 
+  private isChatNavigationLocked(): boolean {
+    return Boolean(
+      this.state.sending ||
+        this.state.pendingMentorReply ||
+        this.cancellationInFlight,
+    );
+  }
+
   private async retryLastFailedMessage(): Promise<void> {
     const lastFailedMessage = [...this.state.messages]
       .reverse()
@@ -3204,55 +3585,107 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       : undefined;
 
     this.cancellationInFlight = true;
+    this.cancelledSendRequestTokens.add(activeSendRequestToken);
+    this.stopPendingMentorTracking();
+    this.finalizeCancelledMentorReply({
+      conversationId: pendingConversationId,
+      partialContent,
+      source: "manual",
+      updateChats: true,
+    });
+    if (pendingConversationId) {
+      this.conversationHistoryCache.delete(pendingConversationId);
+      this.unreadConversationIds.add(pendingConversationId);
+    }
+
+    const cancellationController = new AbortController();
+    const cancellationTimeout = setTimeout(
+      () => cancellationController.abort(),
+      CANCELLATION_REQUEST_TIMEOUT_MS,
+    );
     try {
       const result = pendingJobId
         ? await this.api.cancelMentorJob(
             pendingJobId,
             cancelledPartialContext,
+            cancellationController.signal,
           )
         : clientRequestId
           ? await this.api.cancelMentorRequest(
               clientRequestId,
               cancelledPartialContext,
+              cancellationController.signal,
             )
           : null;
+
+      if (
+        result?.conversation_id &&
+        pendingConversationId &&
+        this.isTransientConversationId(pendingConversationId)
+      ) {
+        const localSummary = this.localChatSummaries.get(pendingConversationId);
+        if (localSummary) {
+          this.promoteLocalConversation(
+            pendingConversationId,
+            result.conversation_id,
+            localSummary,
+          );
+          this.updateState({
+            chats: this.upsertChatSummary(
+              this.decorateChatSummary({
+                ...localSummary,
+                id: result.conversation_id,
+              }),
+              pendingConversationId,
+            ),
+            currentConversationId: result.conversation_id,
+          });
+          if (partialContent) {
+            this.cancelledPartialsByConversationId.set(result.conversation_id, {
+              content: partialContent,
+              createdAt: cancelledPartialContext?.created_at,
+              source: "manual",
+            });
+          }
+          await this.persistSelection();
+        }
+      }
 
       if (result && result.status !== "cancelled") {
         // Completion or failure won the race. Reload the durable outcome
         // instead of falsely replacing it with a cancellation marker.
         if (
-          pendingConversationId &&
-          !this.isTransientConversationId(pendingConversationId)
+          result.conversation_id &&
+          !this.isTransientConversationId(result.conversation_id)
         ) {
           await this.loadWorkspaceState({
-            conversationId: pendingConversationId,
+            conversationId: result.conversation_id,
             background: true,
             forceRefreshConversation: true,
           });
         }
         return;
       }
-
-      this.cancelledSendRequestTokens.add(activeSendRequestToken);
-      this.stopPendingMentorTracking();
-      if (this.state.sending || this.state.pendingMentorReply) {
-        this.finalizeCancelledMentorReply({
-          conversationId: pendingConversationId,
-          partialContent,
-          source: "manual",
-          updateChats: true,
-        });
-      }
-      if (pendingConversationId) {
-        this.conversationHistoryCache.delete(pendingConversationId);
-        this.unreadConversationIds.add(pendingConversationId);
-      }
     } catch (error) {
       this.updateState({
         errorMessage: `Could not confirm cancellation. ${this.toErrorMessage(error)}`,
         canRetryConnection: this.isConnectionError(error),
       });
+      if (
+        pendingJobId &&
+        pendingConversationId &&
+        !this.isTransientConversationId(pendingConversationId)
+      ) {
+        void this.waitForBackgroundJob({
+          conversation_id: pendingConversationId,
+          user_message_id: "",
+          job_id: pendingJobId,
+          status: "processing",
+          stage: pendingReply?.stage ?? "queued",
+        });
+      }
     } finally {
+      clearTimeout(cancellationTimeout);
       this.cancelledSendRequestTokens.delete(activeSendRequestToken);
       this.cancellationInFlight = false;
     }
@@ -3687,6 +4120,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private clearPendingReply(conversationId: string): void {
+    const pendingReply = this.pendingRepliesByConversationId.get(conversationId);
+    if (pendingReply?.jobId && pendingReply.jobId !== "pending") {
+      this.allowedOpenedTabPathsByJobId.delete(pendingReply.jobId);
+    }
     this.pendingRepliesByConversationId.delete(conversationId);
   }
 
@@ -3955,6 +4392,24 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     return isProtectedContextPath(relativePath);
   }
 
+  private normalizeContextRequestPath(value: string): string {
+    return normalizeContextPath(value);
+  }
+
+  private rememberAllowedOpenedTabPaths(
+    jobId: string,
+    openedTabPaths: string[],
+  ): void {
+    this.allowedOpenedTabPathsByJobId.set(
+      jobId,
+      new Set(
+        openedTabPaths.map((filePath) =>
+          this.normalizeContextRequestPath(filePath),
+        ),
+      ),
+    );
+  }
+
   private async readWorkspaceFileContext(
     relativePath: string,
   ): Promise<OpenTabContext | null> {
@@ -3981,6 +4436,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         return buildFileContextFromText({
           documentPath: fileUri.fsPath,
           workspaceFolderPath: workspaceFolder.uri.fsPath,
+          workspaceFolderLabel:
+            workspaceFolders.length > 1 ? workspaceFolder.name : undefined,
           text: new TextDecoder().decode(fileBytes),
           isActive: false,
           source: "workspace_hint",
@@ -4032,30 +4489,45 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     jobId: string,
     request: MentorContextRequest | null | undefined,
   ): Promise<void> {
-    if (!request || this.submittedContextRequestIds.has(request.request_id)) {
+    if (
+      !request ||
+      typeof request.request_id !== "string" ||
+      !request.request_id.trim() ||
+      typeof request.file_path !== "string" ||
+      !request.file_path.trim() ||
+      request.file_path.length > 2_048
+    ) {
+      return;
+    }
+    const requestKey = `${jobId}:${request.request_id}`;
+    if (this.submittedContextRequestIds.has(requestKey)) {
       return;
     }
 
-    this.submittedContextRequestIds.add(request.request_id);
+    this.submittedContextRequestIds.add(requestKey);
     const requestedPath = request.file_path.replace(/\\/g, "/").trim();
+    const allowedPaths = this.allowedOpenedTabPathsByJobId.get(jobId);
+
+    if (!isMentorContextRequestAllowed({
+      workspaceTrusted: vscode.workspace.isTrusted,
+      requestedPath,
+      allowedPaths: allowedPaths ?? [],
+    })) {
+      await this.api.submitMentorContext(jobId, {
+        request_id: request.request_id,
+        file_path: request.file_path,
+        unavailable_reason: "The requested file was not approved for this mentor job.",
+        source: "opened_tab_request",
+      });
+      return;
+    }
     let matchingUri: vscode.Uri | undefined;
 
     const pathsMatch = (tabUri: vscode.Uri): boolean => {
       const tabPath =
         tabUri.scheme === "file" ? tabUri.fsPath : tabUri.toString();
-      const normalizePath = (value: string): string => {
-        let normalized = value.replace(/\\/g, "/").trim();
-        while (
-          normalized.length >= 2 &&
-          normalized[0] === normalized[normalized.length - 1] &&
-          ['"', "'", "`"].includes(normalized[0])
-        ) {
-          normalized = normalized.slice(1, -1).trim();
-        }
-        return normalized.replace(/\/{2,}/g, "/").toLowerCase();
-      };
-      const normalizedTabPath = normalizePath(tabPath);
-      const normalizedRequestedPath = normalizePath(requestedPath);
+      const normalizedTabPath = this.normalizeContextRequestPath(tabPath);
+      const normalizedRequestedPath = this.normalizeContextRequestPath(requestedPath);
       if (normalizedTabPath === normalizedRequestedPath) {
         return true;
       }
@@ -4064,12 +4536,16 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
       // an absolute filesystem path. Compare exact relative forms only so two
       // open files with the same suffix cannot be confused.
       for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
-        const relativePath = path
+        const folderRelativePath = path
           .relative(workspaceFolder.uri.fsPath, tabPath)
           .replace(/\\/g, "/")
           .trim()
           .replace(/\/{2,}/g, "/")
           .toLowerCase();
+        const relativePath =
+          (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+            ? `${workspaceFolder.name.toLowerCase()}/${folderRelativePath}`
+            : folderRelativePath;
         if (relativePath && relativePath === normalizedRequestedPath) {
           return true;
         }
@@ -4104,26 +4580,17 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
     try {
       const document = await vscode.workspace.openTextDocument(matchingUri);
-      const lines = sanitizePromptContextText(document.getText()).split(
-        /\r?\n/,
-      );
-      const start = Math.max(1, request.start_line ?? 1);
-      const end = Math.min(
-        lines.length,
-        request.end_line && request.end_line >= start
-          ? request.end_line
-          : start + 399,
-      );
-      const content = lines
-        .slice(start - 1, end)
-        .join("\n")
-        .trim();
+      const boundedContext = buildBoundedRequestedFileContext({
+        text: document.getText(),
+        startLine: request.start_line,
+        endLine: request.end_line,
+      });
 
       await this.api.submitMentorContext(jobId, {
         request_id: request.request_id,
         file_path: request.file_path,
-        content,
-        total_lines: lines.length,
+        content: boundedContext.content,
+        total_lines: boundedContext.totalLines,
         source: "opened_tab_request",
       });
     } catch {
@@ -4145,9 +4612,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
     const selectedText = editor.selection.isEmpty
       ? null
       : editor.document.getText(editor.selection);
-    const workspaceFolderPath = vscode.workspace.getWorkspaceFolder(
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(
       editor.document.uri,
-    )?.uri.fsPath;
+    );
+    const workspaceFolderPath = workspaceFolder?.uri.fsPath;
 
     const context = buildActiveEditorCodeContext({
       documentPath:
@@ -4155,6 +4623,10 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           ? editor.document.uri.fsPath
           : editor.document.fileName,
       workspaceFolderPath,
+      workspaceFolderLabel:
+        workspaceFolder && (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+          ? workspaceFolder.name
+          : undefined,
       selectedText,
       fullDocumentText: editor.document.getText(),
       selectionStartLine: editor.selection.start.line,
@@ -5718,6 +6190,15 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           }
           lastAppliedStateVersion = incomingStateVersion;
 
+          if (state.session && !newState?.session) {
+            draft = { email: "", password: "", message: "" };
+            vscode.setState({
+              ui,
+              draft: { email: "", message: "" },
+              viewport,
+            });
+          }
+
           if (deferCompletedStreamingState(newState)) {
             return;
           }
@@ -6824,11 +7305,11 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             \${renderErrorNotice()}
             <label>
               Email
-              <input id="login-email" type="email" value="\${escapeHtml(draft.email)}" placeholder="student@example.com" />
+              <input id="login-email" type="email" maxlength="320" value="\${escapeHtml(draft.email)}" placeholder="student@example.com" />
             </label>
             <label>
               Password
-              <input id="login-password" type="password" value="\${escapeHtml(draft.password)}" placeholder="Password" />
+              <input id="login-password" type="password" maxlength="4096" value="\${escapeHtml(draft.password)}" placeholder="Password" />
             </label>
             <button id="login-submit" \${state.loading ? "disabled" : ""}>
               \${state.loading ? "Logging in..." : "Log in"}
@@ -6924,7 +7405,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
           <div class="grid">
             <label>
               School
-              <select id="school-select" \${state.loading ? "disabled" : ""}>
+              <select id="school-select" \${state.loading || state.sending || state.pendingMentorReply ? "disabled" : ""}>
                 \${renderSelectOptions(state.schools, state.selectedSchoolId, "Select school", (item) => {
                   return item.membershipRole ? \`\${item.name} (\${item.membershipRole})\` : item.name;
                 })}
@@ -6932,7 +7413,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             </label>
             <label>
               Course
-              <select id="course-select" \${state.loading || !state.selectedSchoolId ? "disabled" : ""}>
+              <select id="course-select" \${state.loading || state.sending || state.pendingMentorReply || !state.selectedSchoolId ? "disabled" : ""}>
                 \${renderSelectOptions(state.courses, state.selectedCourseId, "Select course", (item) => item.name)}
               </select>
             </label>
@@ -6945,7 +7426,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         return \`
           <label>
             Assignment
-            <select id="assignment-select" \${state.loading || !state.selectedCourseId ? "disabled" : ""}>
+            <select id="assignment-select" \${state.loading || state.sending || state.pendingMentorReply || !state.selectedCourseId ? "disabled" : ""}>
               \${renderSelectOptions(state.assignments, state.selectedAssignmentId, "No assignment", (item) => item.title)}
             </select>
           </label>
@@ -7127,6 +7608,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             return "Checking the selected code and nearby lines…";
           case "reviewing_related_code":
             return "Reading related code in nearby files…";
+          case "waiting_for_context":
+            return "Waiting for the requested open-file context...";
           case "retrieving_course_material":
             return "Pulling in course material context…";
           case "generating":
@@ -7228,7 +7711,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
               });
               const contextTooltip = formatContextTooltip(contextEntries);
               return \`
-                <button class="chat-item" data-conversation-id="\${escapeHtml(chat.id)}">
+                <button class="chat-item" data-conversation-id="\${escapeHtml(chat.id)}" \${state.sending || state.pendingMentorReply ? "disabled" : ""}>
                   <strong>\${escapeHtml(chat.title)}</strong>
                   \${chat.hasUnreadResponse ? '<div class="subtle unread-label">New message</div>' : ""}
                   \${chat.hasPendingResponse ? \`
@@ -7248,7 +7731,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
               \`;
             } catch (_error) {
               return \`
-                <button class="chat-item" data-conversation-id="\${escapeHtml(String(chat.id ?? ""))}">
+                <button class="chat-item" data-conversation-id="\${escapeHtml(String(chat.id ?? ""))}" \${state.sending || state.pendingMentorReply ? "disabled" : ""}>
                   <strong>Chat unavailable</strong>
                   <div class="subtle">This chat row could not be rendered safely.</div>
                 </button>
@@ -7433,7 +7916,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
               <div class="grid assignment-controls">
                 <label>
                   Course
-                  <select id="course-select" \${state.loading || !state.selectedSchoolId ? "disabled" : ""}>
+                  <select id="course-select" \${state.loading || state.sending || state.pendingMentorReply || !state.selectedSchoolId ? "disabled" : ""}>
                     \${renderSelectOptions(state.courses, state.selectedCourseId, "Select course", (item) => item.name)}
                   </select>
                 </label>
@@ -7482,7 +7965,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
                 <div>
                   <h2>Chat history</h2>
                 </div>
-                <button id="new-chat-button" class="secondary">New chat</button>
+                <button id="new-chat-button" class="secondary" \${isChatNavigationLocked ? "disabled" : ""}>New chat</button>
               </div>
               <div id="chat-history-list" class="chat-list">\${renderChatList()}</div>
             </section>
@@ -7514,7 +7997,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
             <div id="messages" class="messages">\${renderMessages()}</div>
             <div class="chat-composer">
               <div class="composer-input">
-                <textarea id="chat-message" placeholder="Ask about the course, assignment, or code you are working on." \${shouldAutoFocusChatMessage() ? "autofocus" : ""} \${state.loading || !state.selectedCourseId || !!state.blockedMessage || chatMessageLimitReached ? "disabled" : ""}>\${escapeHtml(draft.message)}</textarea>
+                <textarea id="chat-message" maxlength="${MAX_WEBVIEW_MESSAGE_LENGTH}" placeholder="Ask about the course, assignment, or code you are working on." \${shouldAutoFocusChatMessage() ? "autofocus" : ""} \${state.loading || !state.selectedCourseId || !!state.blockedMessage || chatMessageLimitReached ? "disabled" : ""}>\${escapeHtml(draft.message)}</textarea>
                 <button id="send-button" class="send-icon \${state.sending ? "stop-icon" : ""}" aria-label="\${state.sending ? "Stop response" : "Send message"}" title="\${state.sending ? "Stop" : "Send"}" \${!state.sending && (state.loading || !state.selectedCourseId || !!state.blockedMessage || chatMessageLimitReached) ? "disabled" : ""}>
                   \${state.sending ? \`
                     <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -7595,6 +8078,8 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         const signoutButton = document.getElementById("signout-button");
         if (signoutButton) {
           signoutButton.addEventListener("click", () => {
+            draft = { email: "", password: "", message: "" };
+            persistUiState();
             vscode.postMessage({ type: "signOut" });
           });
         }
@@ -7626,6 +8111,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         const schoolSelect = document.getElementById("school-select");
         if (schoolSelect) {
           schoolSelect.addEventListener("change", (event) => {
+            if (state.sending || state.pendingMentorReply) return;
             vscode.postMessage({
               type: "selectSchool",
               schoolId: event.target.value,
@@ -7636,6 +8122,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         const courseSelect = document.getElementById("course-select");
         if (courseSelect) {
           courseSelect.addEventListener("change", (event) => {
+            if (state.sending || state.pendingMentorReply) return;
             vscode.postMessage({
               type: "selectCourse",
               courseId: event.target.value,
@@ -7646,6 +8133,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
         const assignmentSelect = document.getElementById("assignment-select");
         if (assignmentSelect) {
           assignmentSelect.addEventListener("change", (event) => {
+            if (state.sending || state.pendingMentorReply) return;
             vscode.postMessage({
               type: "selectAssignment",
               assignmentId: event.target.value || null,
@@ -7685,6 +8173,7 @@ class StackMentorSidebarProvider implements vscode.WebviewViewProvider {
 
         for (const chatButton of document.querySelectorAll("[data-conversation-id]")) {
           chatButton.addEventListener("click", () => {
+            if (state.sending || state.pendingMentorReply) return;
             const conversationId = chatButton.getAttribute("data-conversation-id");
             if (conversationId) {
               draft.message = "";

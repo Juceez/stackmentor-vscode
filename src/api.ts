@@ -176,7 +176,12 @@ type RequestOptions = {
   auth?: boolean;
   allow404?: boolean;
   skipRefresh?: boolean;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  sessionOverride?: AuthSession;
 };
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 type ClientOptions = {
   getBaseUrl: () => string;
@@ -537,9 +542,10 @@ export class StackMentorApiClient {
     }
   }
 
-  async logout(): Promise<void> {
+  async logout(sessionOverride?: AuthSession): Promise<void> {
     await this.request<{ message: string }>("/auth/logout", {
       method: "POST",
+      sessionOverride,
     });
   }
 
@@ -688,6 +694,7 @@ export class StackMentorApiClient {
   async cancelMentorJob(
     jobId: string,
     cancelledPartialContext?: CancelledPartialContext,
+    signal?: AbortSignal,
   ): Promise<MentorJobStatusResponse> {
     return this.request<MentorJobStatusResponse>(
       `/mentor/jobs/${jobId}/cancel`,
@@ -696,6 +703,7 @@ export class StackMentorApiClient {
         body: cancelledPartialContext
           ? { cancelled_partial_context: cancelledPartialContext }
           : undefined,
+        signal,
       },
     );
   }
@@ -755,6 +763,7 @@ export class StackMentorApiClient {
   async cancelMentorRequest(
     clientRequestId: string,
     cancelledPartialContext?: CancelledPartialContext,
+    signal?: AbortSignal,
   ): Promise<MentorJobStatusResponse | null> {
     const result = await this.request<MentorJobStatusResponse | null>(
       `/mentor/requests/${encodeURIComponent(clientRequestId)}/cancel`,
@@ -763,6 +772,7 @@ export class StackMentorApiClient {
         body: cancelledPartialContext
           ? { cancelled_partial_context: cancelledPartialContext }
           : undefined,
+        signal,
       },
     );
     return result ?? null;
@@ -895,7 +905,7 @@ export class StackMentorApiClient {
         headers.set("Authorization", `Bearer ${token}`);
       }
 
-      return fetch(
+      return this.fetchWithTimeout(
         `${resolveApiBaseUrl(this.options.getBaseUrl())}/mentor/message/stream`,
         {
           method: "POST",
@@ -937,6 +947,7 @@ export class StackMentorApiClient {
     let buffer = "";
     let eventName = "message";
     let dataLines: string[] = [];
+    let reachedTerminal = false;
 
     const dispatchEvent = async () => {
       if (dataLines.length === 0) {
@@ -949,6 +960,16 @@ export class StackMentorApiClient {
 
       if (eventName.startsWith("job.")) {
         const payload = JSON.parse(payloadText) as MentorJobEventResponse;
+        if (
+          payload.event === "job.completed" ||
+          payload.event === "job.failed" ||
+          payload.event === "job.cancelled" ||
+          payload.job.status === "completed" ||
+          payload.job.status === "failed" ||
+          payload.job.status === "cancelled"
+        ) {
+          reachedTerminal = true;
+        }
         await onEvent(payload);
       }
 
@@ -992,6 +1013,12 @@ export class StackMentorApiClient {
       await dispatchEvent();
     }
 
+    if (!reachedTerminal && !signal?.aborted) {
+      throw new ApiError(
+        502,
+        "StackMentor's reply stream closed before the job finished.",
+      );
+    }
   }
 
   private async request<T>(
@@ -1004,6 +1031,8 @@ export class StackMentorApiClient {
       auth = true,
       allow404 = false,
       skipRefresh = false,
+      signal,
+      timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     } = options;
 
     const attempt = async (token?: string): Promise<Response> => {
@@ -1016,14 +1045,21 @@ export class StackMentorApiClient {
         headers.set("Authorization", `Bearer ${token}`);
       }
 
-      return fetch(`${resolveApiBaseUrl(this.options.getBaseUrl())}${path}`, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      return this.fetchWithTimeout(
+        `${resolveApiBaseUrl(this.options.getBaseUrl())}${path}`,
+        {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal,
+        },
+        timeoutMs,
+      );
     };
 
-    const session = auth ? await this.options.getSession() : null;
+    const session = auth
+      ? (options.sessionOverride ?? (await this.options.getSession()))
+      : null;
     const firstResponse = await attempt(session?.accessToken);
 
     if (allow404 && firstResponse.status === 404) {
@@ -1075,11 +1111,14 @@ export class StackMentorApiClient {
         headers.set("Authorization", `Bearer ${token}`);
       }
 
-      return fetch(`${resolveApiBaseUrl(this.options.getBaseUrl())}${path}`, {
-        method: "GET",
-        headers,
-        signal: options.signal,
-      });
+      return this.fetchWithTimeout(
+        `${resolveApiBaseUrl(this.options.getBaseUrl())}${path}`,
+        {
+          method: "GET",
+          headers,
+          signal: options.signal,
+        },
+      );
     };
 
     const session = await this.options.getSession();
@@ -1105,6 +1144,35 @@ export class StackMentorApiClient {
     }
 
     return firstResponse;
+  }
+
+  private async fetchWithTimeout(
+    input: string,
+    init: RequestInit,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const externalSignal = init.signal;
+    const abortFromExternalSignal = () => controller.abort(externalSignal?.reason);
+
+    if (externalSignal?.aborted) {
+      abortFromExternalSignal();
+    } else {
+      externalSignal?.addEventListener("abort", abortFromExternalSignal, {
+        once: true,
+      });
+    }
+
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortFromExternalSignal);
+    }
   }
 
   private async parseJson<T>(response: Response): Promise<T> {
